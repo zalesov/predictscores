@@ -1,92 +1,50 @@
-name: "Odds watcher"
+name: odds-watcher
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # every 15m UTC
+    - cron: "*/15 * * * *"   # every 15 min
   workflow_dispatch:
-    inputs:
-      slot:
-        description: "am / pm / late (optional override)"
-        required: false
-        default: ""
-
-concurrency:
-  group: odds-watcher
-  cancel-in-progress: true
 
 jobs:
-  watch:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 7
-    permissions:
-      contents: read
     env:
-      API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
-      BASE_URL: ${{ vars.BASE_URL || secrets.BASE_URL || 'https://predictscores.vercel.app' }}
-      # cooldown and safety caps
-      COOLDOWN_MINUTES: 12
+      BASE: https://predictscores.vercel.app
     steps:
-      - name: Compute slot (Europe/Belgrade)
-        id: ctx
-        run: |
-          set -euo pipefail
-          TZZ="Europe/Belgrade"
-          H=$(TZ=$TZZ date +%H)
-          if [ -n "${{ github.event.inputs.slot }}" ]; then
-            SLOT="${{ github.event.inputs.slot }}"
-          else
-            if   [ "$H" -lt 10 ]; then SLOT="late";
-            elif [ "$H" -lt 15 ]; then SLOT="am";
-            else                       SLOT="pm"; fi
-          fi
-          echo "slot=$SLOT" >> "$GITHUB_OUTPUT"
-          echo "Slot=$SLOT (Belgrade hour=$H)"
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Warm & read last refresh timestamp (via value-bets-locked)
-        id: warm
+      - name: Compute YMD & SLOT (Europe/Belgrade)
+        id: when
         run: |
-          set -euo pipefail
-          OUT=$(curl -fsS -A "gha-odds-watcher/1.2" --connect-timeout 10 --max-time 20 \
-                "$BASE_URL/api/value-bets-locked" || echo '{}')
-          TS=$(printf "%s" "$OUT" | jq -r 'try .meta.last_odds_refresh.ts catch ""' 2>/dev/null || echo "")
-          SRC=$(printf "%s" "$OUT" | jq -r 'try .meta.last_odds_refresh.source catch ""' 2>/dev/null || echo "")
-          if [ "$TS" = "null" ] || [ -z "$TS" ]; then
-            echo "ts=" >> "$GITHUB_OUTPUT"
-            echo "::notice::No freshness marker found; proceeding to refresh."
-          else
-            echo "ts=$TS" >> "$GITHUB_OUTPUT"
-            echo "::notice::Found freshness marker from $SRC → $TS"
-          fi
+          YMD=$(TZ=Europe/Belgrade date +%F)
+          H=$(TZ=Europe/Belgrade date +%H)
+          if   [ "$H" -lt 12 ]; then SLOT=am;
+          elif [ "$H" -lt 17 ]; then SLOT=pm;
+          else                         SLOT=late; fi
+          echo "ymd=$YMD"   >> $GITHUB_OUTPUT
+          echo "slot=$SLOT" >> $GITHUB_OUTPUT
 
-      - name: Enforce cooldown
-        id: cool
+      - name: Probe locked (items) and union length
+        id: probe
         run: |
-          set -euo pipefail
-          TS="${{ steps.warm.outputs.ts }}"
-          RAW="${COOLDOWN_MINUTES:-12}"
-          if ! [[ "$RAW" =~ ^[0-9]+$ ]]; then RAW=12; fi
-          COOLDOWN_SECS=$((RAW*60))
-          if [ -n "$TS" ]; then
-            if EPOCH=$(date -d "$TS" +%s 2>/dev/null); then
-              NOW=$(date -u +%s)
-              AGE=$((NOW - EPOCH))
-              if [ "$AGE" -lt "$COOLDOWN_SECS" ]; then
-                echo "::notice::Cooldown active ($AGE s < $COOLDOWN_SECS s). Skipping refresh."
-                echo "skip=true" >> "$GITHUB_OUTPUT"
-              else
-                echo "skip=false" >> "$GITHUB_OUTPUT"
-              fi
-            else
-              echo "skip=false" >> "$GITHUB_OUTPUT"
-            fi
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
+          Y="${{ steps.when.outputs.ymd }}"
+          S="${{ steps.when.outputs.slot }}"
+          LOCKED="$(curl -fsS "$BASE/api/value-bets-locked?ymd=$Y&slot=$S&slim=1" || echo '{}')"
+          ITEMS="$(echo "$LOCKED" | jq -r '.items | length // 0')"
+          UNION="$(curl -fsS "$BASE/api/debug/kv?key=vb:day:$Y:union" || echo '{}')"
+          ULEN="$(echo "$UNION" | jq -r '.kv.value | length // 0')"
+          echo "items=$ITEMS" >> $GITHUB_OUTPUT
+          echo "ulen=$ULEN"   >> $GITHUB_OUTPUT
 
-      - name: Refresh odds (bounded)
-        if: steps.cool.outputs.skip != 'true'
+      - name: Skip (nothing to refresh)
+        if: steps.probe.outputs.items == '0' || steps.probe.outputs.ulen == '0'
         run: |
-          set -euo pipefail
-          SLOT="${{ steps.ctx.outputs.slot }}"
-          # IMPORTANT: do NOT force refresh; respect server-side guards
-          curl -fsSL --max-time 120 "$BASE_URL/api/cron/refresh-odds?slot=$SLOT"
+          echo "Skip: items=${{ steps.probe.outputs.items }}, union=${{ steps.probe.outputs.ulen }}"
+
+      - name: Refresh odds (guarded)
+        if: steps.probe.outputs.items != '0' && steps.probe.outputs.ulen != '0'
+        run: |
+          Y="${{ steps.when.outputs.ymd }}"
+          S="${{ steps.when.outputs.slot }}"
+          curl -fsS "$BASE/api/cron/refresh-odds?ymd=$Y&slot=$S&debug=1"
