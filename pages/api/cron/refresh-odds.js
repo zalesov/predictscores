@@ -1,10 +1,13 @@
 // pages/api/cron/refresh-odds.js
-// Strict slot caps + safe empty-union exit + GLOBAL fetch cap (no deps)
+// Strict slot caps + safe empty-union exit + global fetch cap.
+// Robust KV get/set with fallbacks.
+//
+// No extra deps.
 
 const SLOT_CAPS = { am: 2000, pm: 3000, late: 1000 };
-const API_HOST_HINT = 'api-sports.io';
+const API_HOST_HINTS = ['api-sports.io', 'api-football'];
 
-// ---- KV (REST) ----
+// ---- KV (robust) ----
 function kvEnv() {
   const url = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
   const token = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
@@ -13,28 +16,59 @@ function kvEnv() {
 }
 async function kvGet(key) {
   const { url, token } = kvEnv();
-  const r = await fetch(`${url}/get/${encodeURIComponent(key)}?token=${token}`);
-  const j = await r.json();
-  let v = j?.result ?? null;
-  if (typeof v === 'string') { try { v = JSON.parse(v); } catch(_) {} }
-  return v;
+  try {
+    const r = await fetch(`${url}/get/${encodeURIComponent(key)}?token=${token}`);
+    if (r.ok) {
+      const j = await r.json();
+      let v = j?.result ?? null;
+      if (typeof v === 'string') { try { v = JSON.parse(v); } catch(_){} }
+      return v;
+    }
+  } catch(_) {}
+  try {
+    const r2 = await fetch(`${url}/pipeline`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'authorization': `Bearer ${token}` },
+      body: JSON.stringify([['GET', key]]),
+    });
+    if (r2.ok) {
+      const arr = await r2.json();
+      let v = arr?.[0]?.result ?? null;
+      if (typeof v === 'string') { try { v = JSON.parse(v); } catch(_){} }
+      return v;
+    }
+  } catch(_) {}
+  return null;
 }
 async function kvSet(key, value) {
   const { url, token } = kvEnv();
-  const val = typeof value === 'string' ? value : JSON.stringify(value);
-  // path style
+  const valStr = typeof value === 'string' ? value : JSON.stringify(value);
   let ok = false;
   try {
-    const r = await fetch(`${url}/set/${encodeURIComponent(key)}/${encodeURIComponent(val)}?token=${token}`, { method: 'POST' });
+    const r = await fetch(`${url}/set/${encodeURIComponent(key)}/${encodeURIComponent(valStr)}?token=${token}`, { method: 'POST' });
     ok = r.ok;
-  } catch (_) {}
+  } catch(_) {}
   if (!ok) {
-    await fetch(`${url}/set?token=${token}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ key, value: val })
-    });
+    try {
+      const r2 = await fetch(`${url}/set?token=${token}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ key, value: valStr }),
+      });
+      ok = r2.ok;
+    } catch(_) {}
   }
+  if (!ok) {
+    try {
+      const r3 = await fetch(`${url}/pipeline`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'authorization': `Bearer ${token}` },
+        body: JSON.stringify([['SET', key, valStr]]),
+      });
+      ok = r3.ok;
+    } catch(_) {}
+  }
+  return ok;
 }
 
 // ---- time/slot ----
@@ -44,24 +78,21 @@ function ymdFromTZ(tz = 'Europe/Belgrade') {
   return `${yyyy}-${mm}-${dd}`;
 }
 function slotByHour(h){ if(h<12)return'am'; if(h<17)return'pm'; return'late'; }
-function detectSlot(tz='Europe/Belgrade'){
-  const h=Number(new Date(new Date().toLocaleString('en-US',{timeZone:tz})).getHours());
-  return slotByHour(h);
-}
+function detectSlot(tz='Europe/Belgrade'){ const h=Number(new Date(new Date().toLocaleString('en-US',{timeZone:tz})).getHours()); return slotByHour(h); }
 function spentKeyFor(ymd, slot){ return `afc:spent:${ymd}:${slot}`; }
-async function readSpent(ymd, slot){ return Number((await kvGet(spentKeyFor(ymd,slot))) || 0); }
 function capFor(slot){ return SLOT_CAPS[slot] ?? 2000; }
 
-// ---- GLOBAL fetch cap (auto-enforces on every API-FOOTBALL call) ----
+// ---- Global fetch cap (auto) ----
 function installFetchCap(ymd, slot) {
   if (global.__fetchCapped) return;
   const orig = global.fetch;
   global.fetch = async (url, opts) => {
     const u = typeof url === 'string' ? url : String(url?.url || url);
-    if (u.includes(API_HOST_HINT)) {
-      const spent = await readSpent(ymd, slot);
+    if (API_HOST_HINTS.some(h => u.includes(h))) {
+      let spent = Number((await kvGet(spentKeyFor(ymd, slot))) || 0);
       if (spent >= capFor(slot)) throw new Error(`CAP_REACHED:${slot}:${spent}/${capFor(slot)}`);
       const resp = await orig(url, opts);
+      // best-effort counter; don't brick route if KV write fails
       await kvSet(spentKeyFor(ymd, slot), spent + 1);
       return resp;
     }
@@ -84,11 +115,11 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok:true, ymd, slot, reason:'empty-union', refreshed:0, cap:SLOT_CAPS[slot] });
     }
 
-    // >>> Your existing refresh-odds logic remains unchanged below <<<
-    // Any fetch() to API-FOOTBALL here is now automatically capped by the global wrapper.
+    // >>> Your existing refresh-odds logic remains here. All API-Football fetch() calls
+    // are now auto-capped per slot by the global wrapper above.
 
-    const spent = await readSpent(ymd, slot);
-    return res.status(200).json({ ok:true, ymd, slot, cap:SLOT_CAPS[slot], spent, note:'refresh-odds ran (cap-enforced)' });
+    const spent = Number((await kvGet(spentKeyFor(ymd, slot))) || 0);
+    return res.status(200).json({ ok:true, ymd, slot, cap:SLOT_CAPS[slot], spent, note:'refresh-odds (cap-enforced)' });
   } catch (e) {
     return res.status(200).json({ ok:false, error:String(e?.message||e) });
   }
