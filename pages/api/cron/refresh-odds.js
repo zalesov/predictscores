@@ -1,5 +1,6 @@
 // pages/api/cron/refresh-odds.js
-// Unified KV + global cap guard + safe early-exit on empty union
+// Osveži kvote (tvoja postojeća logika) + upiši meta za locked feed.
+// Capovi: AM=2000, PM=3000, LATE=1000. KV-only upis meta (bez dodatnih AF poziva).
 
 const SLOT_CAPS = { am:2000, pm:3000, late:1000 };
 const API_HINTS = ['api-sports.io','api-football'];
@@ -10,30 +11,28 @@ function resolveKV() {
   if (!url || !token) throw new Error('KV env missing');
   return { url, token };
 }
-async function kvGet(key){
+async function kvPipeline(cmds) {
   const { url, token } = resolveKV();
-  try {
-    const r = await fetch(`${url}/get/${encodeURIComponent(key)}?token=${token}`);
-    if (r.ok){ const j=await r.json(); let v=j?.result??null; if(typeof v==='string'){try{v=JSON.parse(v);}catch(_){}} return v; }
-  } catch(_) {}
-  try{
-    const r2=await fetch(`${url}/pipeline`,{ method:'POST', headers:{'content-type':'application/json','authorization':`Bearer ${token}`}, body: JSON.stringify([['GET', key]]) });
-    if (r2.ok){ const arr=await r2.json(); let v=arr?.[0]?.result??null; if(typeof v==='string'){try{v=JSON.parse(v);}catch(_){}} return v; }
-  }catch(_) {}
-  return null;
+  const r = await fetch(`${url}/pipeline`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+    body: JSON.stringify(cmds),
+  });
+  if (!r.ok) throw new Error(`KV_PIPELINE_HTTP_${r.status}`);
+  return r.json();
 }
-async function kvSet(key,value){
-  const { url, token } = resolveKV();
-  const val=typeof value==='string'? value : JSON.stringify(value);
-  let ok=false;
-  try{ const r=await fetch(`${url}/set/${encodeURIComponent(key)}/${encodeURIComponent(val)}?token=${token}`,{method:'POST'}); ok=r.ok; }catch(_){}
-  if(!ok){
-    try{ const r2=await fetch(`${url}/set`,{method:'POST',headers:{'content-type':'application/json','authorization':`Bearer ${token}`}, body: JSON.stringify({ key, value: val })}); ok=r2.ok; }catch(_){}
-  }
-  if(!ok){
-    try{ const r3=await fetch(`${url}/pipeline`,{method:'POST',headers:{'content-type':'application/json','authorization':`Bearer ${token}`}, body: JSON.stringify([['SET', key, val]])}); ok=r3.ok; }catch(_){}
-  }
-  return ok;
+async function kvGet(key){
+  try{
+    const arr=await kvPipeline([['GET', key]]);
+    let v=arr?.[0]?.result ?? null;
+    if (typeof v === 'string') { try { v = JSON.parse(v); } catch {} }
+    return v;
+  }catch{ return null; }
+}
+async function kvSet(key, value){
+  const val = typeof value === 'string' ? value : JSON.stringify(value);
+  await kvPipeline([['SET', key, val]]);
+  return true;
 }
 
 function ymdFromTZ(tz='Europe/Belgrade'){ const d=new Date(new Date().toLocaleString('en-US',{timeZone:tz})); const y=d.getFullYear(), m=String(d.getMonth()+1).padStart(2,'0'), dd=String(d.getDate()).padStart(2,'0'); return `${y}-${m}-${dd}`; }
@@ -51,7 +50,7 @@ function installCap(ymd,slot){
       let spent = Number((await kvGet(spentKey(ymd,slot)))||0);
       if (spent >= capFor(slot)) throw new Error(`CAP_REACHED:${slot}:${spent}/${capFor(slot)}`);
       const resp = await orig(url, opts);
-      await kvSet(spentKey(ymd,slot), spent+1); // best-effort
+      try { await kvSet(spentKey(ymd,slot), spent+1); } catch {}
       return resp;
     }
     return orig(url, opts);
@@ -67,15 +66,27 @@ export default async function handler(req,res){
 
     installCap(ymd,slot);
 
-    const union=(await kvGet(`vb:day:${ymd}:union`))||[];
-    if(!Array.isArray(union)||union.length===0){
-      return res.status(200).json({ ok:true, ymd, slot, reason:'empty-union', refreshed:0, cap:SLOT_CAPS[slot] });
+    // Ako nema union/vbl_full → nema smisla trošiti AF
+    const union = (await kvGet(`vb:day:${ymd}:union`)) || [];
+    if (!Array.isArray(union) || union.length === 0) {
+      return res.status(200).json({ ok:true, ymd, slot, reason:'empty-union', refreshed:0, cap: capFor(slot) });
     }
 
-    // ... your existing refresh steps (now auto-capped) ...
+    // --- Ovde ide TVOJA postojeća logika osvežavanja kvota ---
+    // ... (namerno je ne diramo)
+    // Pretpostavlja se da tokom procesa ažuriraš `vb-locked:kv:hit` (listu ID-eva)
+    // ---------------------------------------------------------
+
+    // UPIŠI META tako da /api/value-bets-locked dobije ts/last_odds_refresh
+    const nowIso = new Date().toISOString();
+    await kvSet('vb-locked:kv:hit:meta', {
+      ymd, slot,
+      ts: nowIso,
+      last_odds_refresh: nowIso
+    });
 
     const spent = Number((await kvGet(spentKey(ymd,slot)))||0);
-    return res.status(200).json({ ok:true, ymd, slot, cap:SLOT_CAPS[slot], spent, note:'refresh-odds (cap enforced)' });
+    return res.status(200).json({ ok:true, ymd, slot, cap: capFor(slot), spent, note:'refresh-odds (cap enforced)' });
   }catch(e){
     return res.status(200).json({ ok:false, error:String(e?.message||e) });
   }
