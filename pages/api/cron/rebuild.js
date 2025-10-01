@@ -37,7 +37,7 @@ function ymdFromTZ(tz = 'Europe/Belgrade') {
 function slotByHour(h){ if(h<12)return'am'; if(h<17)return'pm'; return'late'; }
 function detectSlot(tz='Europe/Belgrade'){ const h=Number(new Date(new Date().toLocaleString('en-US',{timeZone:tz})).getHours()); return slotByHour(h); }
 
-async function fetchFixturesForDate(ymd) {
+async function fetchFixturesForDate(ymd, tracker = {}) {
   const key = process.env.API_FOOTBALL_KEY || process.env.NEXT_PUBLIC_API_FOOTBALL_KEY;
   if (!key) throw new Error('API_FOOTBALL_KEY missing');
 
@@ -46,7 +46,9 @@ async function fetchFixturesForDate(ymd) {
   // API-FOOTBALL uses paging info: { paging: { current, total } }
   while (true) {
     const url = `${API_HOST}/fixtures?date=${ymd}&timezone=Europe/Belgrade&page=${page}`;
+    tracker.last_url = url;
     const resp = await fetch(url, { headers: { 'x-apisports-key': key } });
+    tracker.http = resp.status;
     if (!resp.ok) throw new Error(`AF fixtures HTTP ${resp.status}`);
     const data = await resp.json();
 
@@ -77,10 +79,11 @@ export default async function handler(req, res) {
   const ymd = (req.query.ymd || '').match(/^\d{4}-\d{2}-\d{2}$/) ? req.query.ymd : ymdFromTZ(tz);
   const slot = (req.query.slot || '').match(/^(am|pm|late)$/) ? req.query.slot : detectSlot(tz);
   const ts = new Date().toISOString();
+  const tracker = { last_url: null, http: null };
 
   try {
     // 1) Collect fixture IDs for today
-    const ids = await fetchFixturesForDate(ymd);
+    const ids = await fetchFixturesForDate(ymd, tracker);
 
     // 2) Write snapshot chunks
     const chunks = chunkArray(ids, 400); // generous chunk size, few KV writes
@@ -95,16 +98,26 @@ export default async function handler(req, res) {
 
     // 4) Write union (de-dup already done)
     await kvSet(`vb:day:${ymd}:union`, ids);
+    const union_len = ids.length;
 
-    const debug = !!req.query.debug;
     return res.status(200).json({
-      ok: true, ymd, slot, ts,
-      note: 'snapshot+union written',
+      ok: true,
+      ymd,
+      slot,
+      ts,
       size: ids.length,
       chunks: chunks.length,
-      ...(debug ? { sample: ids.slice(0, 10) } : {})
+      union_len,
+      sample: ids.slice(0, 10),
     });
   } catch (e) {
-    return res.status(200).json({ ok: false, ymd, slot, error: String(e?.message || e) });
+    return res.status(200).json({
+      ok: false,
+      ymd,
+      slot,
+      error: String(e?.message || e),
+      last_url: tracker.last_url,
+      http: tracker.http,
+    });
   }
 }
