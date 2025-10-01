@@ -43,12 +43,43 @@ async function fetchFixturesForDate(ymd) {
 
   let page = 1;
   const ids = [];
+  let lastUrl = null;
   // API-FOOTBALL uses paging info: { paging: { current, total } }
   while (true) {
-    const url = `${API_HOST}/fixtures?date=${ymd}&timezone=Europe/Belgrade&page=${page}`;
-    const resp = await fetch(url, { headers: { 'x-apisports-key': key } });
-    if (!resp.ok) throw new Error(`AF fixtures HTTP ${resp.status}`);
-    const data = await resp.json();
+    const path = `/fixtures?from=${ymd}&to=${ymd}&timezone=Europe/Belgrade&page=${page}`;
+    lastUrl = `${API_HOST}${path}`;
+    let resp;
+    try {
+      resp = await fetch(lastUrl, { headers: { 'x-apisports-key': key } });
+    } catch (err) {
+      return {
+        ok: false,
+        last_url: lastUrl,
+        http: { status: null, statusText: 'fetch_error', error: String(err?.message || err) },
+      };
+    }
+
+    const httpMeta = { status: resp.status, statusText: resp.statusText };
+    if (!resp.ok) {
+      let body = null;
+      try { body = await resp.text(); } catch (_) {}
+      return {
+        ok: false,
+        last_url: lastUrl,
+        http: { ...httpMeta, body },
+      };
+    }
+
+    let data;
+    try {
+      data = await resp.json();
+    } catch (err) {
+      return {
+        ok: false,
+        last_url: lastUrl,
+        http: { ...httpMeta, error: 'invalid_json' },
+      };
+    }
 
     const arr = Array.isArray(data?.response) ? data.response : [];
     for (const it of arr) {
@@ -56,14 +87,16 @@ async function fetchFixturesForDate(ymd) {
       if (Number.isInteger(id)) ids.push(id);
     }
 
-    const cur = Number(data?.paging?.current || page);
-    const total = Number(data?.paging?.total || 1);
+    let cur = Number(data?.paging?.current);
+    if (!Number.isFinite(cur) || cur <= 0) cur = page;
+    let total = Number(data?.paging?.total);
+    if (!Number.isFinite(total) || total <= 0) total = cur;
     if (cur >= total) break;
-    page++;
+    page = cur + 1;
     // Safety: do not loop forever
     if (page > 50) break;
   }
-  return Array.from(new Set(ids)); // de-dup
+  return { ok: true, ids: Array.from(new Set(ids)), last_url: lastUrl };
 }
 
 function chunkArray(arr, size) {
@@ -80,7 +113,18 @@ export default async function handler(req, res) {
 
   try {
     // 1) Collect fixture IDs for today
-    const ids = await fetchFixturesForDate(ymd);
+    const fixtureResult = await fetchFixturesForDate(ymd);
+    if (!fixtureResult?.ok) {
+      return res.status(200).json({
+        ok: false,
+        ymd,
+        slot,
+        error: 'fixture_fetch_failed',
+        last_url: fixtureResult?.last_url || null,
+        http: fixtureResult?.http || null,
+      });
+    }
+    const ids = fixtureResult.ids;
 
     // 2) Write snapshot chunks
     const chunks = chunkArray(ids, 400); // generous chunk size, few KV writes
@@ -105,6 +149,13 @@ export default async function handler(req, res) {
       ...(debug ? { sample: ids.slice(0, 10) } : {})
     });
   } catch (e) {
-    return res.status(200).json({ ok: false, ymd, slot, error: String(e?.message || e) });
+    return res.status(200).json({
+      ok: false,
+      ymd,
+      slot,
+      error: String(e?.message || e),
+      last_url: e?.last_url || null,
+      http: e?.http || null,
+    });
   }
 }
