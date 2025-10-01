@@ -7,7 +7,6 @@ function kvEnv() {
   if (!url || !token) throw new Error('KV env missing');
   return { url, token };
 }
-
 async function kvGet(key) {
   const { url, token } = kvEnv();
   const r = await fetch(`${url}/get/${encodeURIComponent(key)}?token=${token}`);
@@ -16,7 +15,6 @@ async function kvGet(key) {
   if (typeof v === 'string') { try { v = JSON.parse(v); } catch (_) {} }
   return v;
 }
-
 function ymdFromTZ(tz = 'Europe/Belgrade') {
   const d = new Date(new Date().toLocaleString('en-US', { timeZone: tz }));
   const yyyy = d.getFullYear();
@@ -37,9 +35,7 @@ export default async function handler(req,res){
     const list=(await kvGet(key))||[];
     const items=Array.isArray(list)?list:[];
 
-    if (req.query.debug) {
-      return res.status(200).json({ ok:true, ymd, slot, count:items.length, key, items });
-    }
+    if (req.query.debug) return res.status(200).json({ ok:true, ymd, slot, count:items.length, key, items });
     return res.status(200).json({ ok:true, items });
   }catch(e){
     return res.status(200).json({ ok:false, error:String(e?.message||e) });
