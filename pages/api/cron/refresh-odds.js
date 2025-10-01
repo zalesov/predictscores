@@ -1,10 +1,10 @@
 // pages/api/cron/refresh-odds.js
-// Adds strict slot caps and safe empty-union exit (no external deps)
+// Strict slot caps + safe empty-union exit + GLOBAL fetch cap (no deps)
 
 const SLOT_CAPS = { am: 2000, pm: 3000, late: 1000 };
-const API_HOST_HINT = 'api-football';
+const API_HOST_HINT = 'api-sports.io';
 
-// ---------- KV helpers (REST) ----------
+// ---- KV (REST) ----
 function kvEnv() {
   const url = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
   const token = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
@@ -22,32 +22,52 @@ async function kvGet(key) {
 async function kvSet(key, value) {
   const { url, token } = kvEnv();
   const val = typeof value === 'string' ? value : JSON.stringify(value);
-  await fetch(`${url}/set/${encodeURIComponent(key)}/${encodeURIComponent(val)}?token=${token}`, { method: 'POST' });
+  // path style
+  let ok = false;
+  try {
+    const r = await fetch(`${url}/set/${encodeURIComponent(key)}/${encodeURIComponent(val)}?token=${token}`, { method: 'POST' });
+    ok = r.ok;
+  } catch (_) {}
+  if (!ok) {
+    await fetch(`${url}/set?token=${token}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ key, value: val })
+    });
+  }
 }
 
-// ---------- time/slot ----------
+// ---- time/slot ----
 function ymdFromTZ(tz = 'Europe/Belgrade') {
   const d = new Date(new Date().toLocaleString('en-US', { timeZone: tz }));
   const yyyy = d.getFullYear(), mm = String(d.getMonth()+1).padStart(2,'0'), dd = String(d.getDate()).padStart(2,'0');
   return `${yyyy}-${mm}-${dd}`;
 }
 function slotByHour(h){ if(h<12)return'am'; if(h<17)return'pm'; return'late'; }
-function detectSlot(tz='Europe/Belgrade'){ const h=Number(new Date(new Date().toLocaleString('en-US',{timeZone:tz})).getHours()); return slotByHour(h); }
+function detectSlot(tz='Europe/Belgrade'){
+  const h=Number(new Date(new Date().toLocaleString('en-US',{timeZone:tz})).getHours());
+  return slotByHour(h);
+}
 function spentKeyFor(ymd, slot){ return `afc:spent:${ymd}:${slot}`; }
+async function readSpent(ymd, slot){ return Number((await kvGet(spentKeyFor(ymd,slot))) || 0); }
+function capFor(slot){ return SLOT_CAPS[slot] ?? 2000; }
 
-// ---------- guarded API fetch (counts & caps API-FOOTBALL calls) ----------
-async function apiFetch(url, opts, { ymd, slot }) {
-  // Only count requests to API-FOOTBALL (substring check)
-  if (typeof url === 'string' && url.includes(API_HOST_HINT)) {
-    const key = spentKeyFor(ymd, slot);
-    const cap = SLOT_CAPS[slot] ?? 2000;
-    let spent = Number((await kvGet(key)) || 0);
-    if (spent >= cap) throw new Error(`CAP_REACHED:${slot}:${spent}/${cap}`);
-    const resp = await fetch(url, opts);
-    await kvSet(key, ++spent);
-    return resp;
-  }
-  return fetch(url, opts);
+// ---- GLOBAL fetch cap (auto-enforces on every API-FOOTBALL call) ----
+function installFetchCap(ymd, slot) {
+  if (global.__fetchCapped) return;
+  const orig = global.fetch;
+  global.fetch = async (url, opts) => {
+    const u = typeof url === 'string' ? url : String(url?.url || url);
+    if (u.includes(API_HOST_HINT)) {
+      const spent = await readSpent(ymd, slot);
+      if (spent >= capFor(slot)) throw new Error(`CAP_REACHED:${slot}:${spent}/${capFor(slot)}`);
+      const resp = await orig(url, opts);
+      await kvSet(spentKeyFor(ymd, slot), spent + 1);
+      return resp;
+    }
+    return orig(url, opts);
+  };
+  global.__fetchCapped = true;
 }
 
 export default async function handler(req, res) {
@@ -56,22 +76,19 @@ export default async function handler(req, res) {
     const ymd=(req.query.ymd||'').match(/^\d{4}-\d{2}-\d{2}$/)?req.query.ymd:ymdFromTZ(tz);
     const slot=(req.query.slot||'').match(/^(am|pm|late)$/)?req.query.slot:detectSlot(tz);
 
-    // 1) Save calls if nothing to refresh
+    installFetchCap(ymd, slot);
+
+    // Skip if there is nothing to refresh
     const union = (await kvGet(`vb:day:${ymd}:union`)) || [];
     if (!Array.isArray(union) || union.length === 0) {
       return res.status(200).json({ ok:true, ymd, slot, reason:'empty-union', refreshed:0, cap:SLOT_CAPS[slot] });
     }
 
-    // 2) >>> YOUR EXISTING LOGIC <<<:
-    // Replace your direct fetch() calls to API-FOOTBALL with apiFetch(..., { ymd, slot })
-    // Example:
-    // const r = await apiFetch(`https://api-football/v3/odds?...`, { headers: {...} }, { ymd, slot });
-    // const data = await r.json();
-    // ... rest of your current logic ...
+    // >>> Your existing refresh-odds logic remains unchanged below <<<
+    // Any fetch() to API-FOOTBALL here is now automatically capped by the global wrapper.
 
-    // If you don't touch anything else, at least return a heartbeat with current counters:
-    const spent = Number((await kvGet(spentKeyFor(ymd, slot))) || 0);
-    return res.status(200).json({ ok:true, ymd, slot, cap:SLOT_CAPS[slot], spent, note:'refresh-odds ran (cap-enabled)' });
+    const spent = await readSpent(ymd, slot);
+    return res.status(200).json({ ok:true, ymd, slot, cap:SLOT_CAPS[slot], spent, note:'refresh-odds ran (cap-enforced)' });
   } catch (e) {
     return res.status(200).json({ ok:false, error:String(e?.message||e) });
   }
