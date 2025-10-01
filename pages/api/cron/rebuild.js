@@ -21,10 +21,91 @@ async function kvGet(key) {
   if (typeof v === 'string') { try { v = JSON.parse(v); } catch (_) {} }
   return v;
 }
-async function kvSet(key, value) {
+function canonicalize(value) {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value && typeof value === 'object') {
+    return Object.keys(value)
+      .sort()
+      .reduce((acc, key) => {
+        acc[key] = canonicalize(value[key]);
+        return acc;
+      }, {});
+  }
+  return value;
+}
+
+function deepEqual(a, b) {
+  if (a === b) return true;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (!deepEqual(a[i], b[i])) return false;
+    }
+    return true;
+  }
+  if (a && b && typeof a === 'object' && typeof b === 'object') {
+    const keysA = Object.keys(a);
+    const keysB = Object.keys(b);
+    if (keysA.length !== keysB.length) return false;
+    for (const key of keysA) {
+      if (!Object.prototype.hasOwnProperty.call(b, key)) return false;
+      if (!deepEqual(a[key], b[key])) return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+function previewValue(value) {
+  const canonical = value && typeof value === 'object' ? canonicalize(value) : value;
+  const str = typeof canonical === 'string' ? canonical : JSON.stringify(canonical);
+  if (!str) return '';
+  return str.length > 200 ? `${str.slice(0, 197)}...` : str;
+}
+
+function valueType(value) {
+  if (Array.isArray(value)) return 'array';
+  if (value === null) return 'null';
+  return typeof value;
+}
+
+function valueSize(value) {
+  if (Array.isArray(value)) return value.length;
+  if (value && typeof value === 'object') return Object.keys(value).length;
+  if (typeof value === 'string') return value.length;
+  if (value === null || value === undefined) return 0;
+  return 1;
+}
+
+async function kvSetVerified(key, value) {
   const { url, token } = kvEnv();
-  const val = typeof value === 'string' ? value : JSON.stringify(value);
-  await fetch(`${url}/set/${encodeURIComponent(key)}/${encodeURIComponent(val)}?token=${token}`, { method: 'POST' });
+  const serialized = typeof value === 'string' ? value : JSON.stringify(value);
+  const setUrl = `${url}/set/${encodeURIComponent(key)}/${encodeURIComponent(serialized)}?token=${token}`;
+  const setResp = await fetch(setUrl, { method: 'POST' });
+  if (!setResp.ok) {
+    throw new Error(`KV set failed (${setResp.status})`);
+  }
+
+  const getResp = await fetch(`${url}/get/${encodeURIComponent(key)}?token=${token}`);
+  if (!getResp.ok) {
+    throw new Error(`KV verification fetch failed (${getResp.status})`);
+  }
+  const getJson = await getResp.json();
+  let got = getJson?.result ?? null;
+  if (typeof got === 'string') {
+    try { got = JSON.parse(got); } catch (_) { /* keep raw string */ }
+  }
+
+  const attemptedCanonical = canonicalize(value);
+  const gotCanonical = canonicalize(got);
+  if (!deepEqual(attemptedCanonical, gotCanonical)) {
+    const err = new Error('KV verification failed');
+    err.key = key;
+    err.attemptedSize = valueSize(value);
+    err.gotType = valueType(got);
+    err.gotPreview = previewValue(got);
+    throw err;
+  }
 }
 
 function ymdFromTZ(tz = 'Europe/Belgrade') {
@@ -85,16 +166,16 @@ export default async function handler(req, res) {
     // 2) Write snapshot chunks
     const chunks = chunkArray(ids, 400); // generous chunk size, few KV writes
     for (let i = 0; i < chunks.length; i++) {
-      await kvSet(`vb:day:${ymd}:snapshot:${i}`, chunks[i]);
+      await kvSetVerified(`vb:day:${ymd}:snapshot:${i}`, chunks[i]);
     }
 
     // 3) Write snapshot index
-    await kvSet(`vb:day:${ymd}:snapshot:index`, {
+    await kvSetVerified(`vb:day:${ymd}:snapshot:index`, {
       ymd, slot, ts, chunks: chunks.length, size: ids.length,
     });
 
     // 4) Write union (de-dup already done)
-    await kvSet(`vb:day:${ymd}:union`, ids);
+    await kvSetVerified(`vb:day:${ymd}:union`, ids);
 
     const debug = !!req.query.debug;
     return res.status(200).json({
@@ -105,6 +186,18 @@ export default async function handler(req, res) {
       ...(debug ? { sample: ids.slice(0, 10) } : {})
     });
   } catch (e) {
+    if (e && e.key) {
+      return res.status(200).json({
+        ok: false,
+        ymd,
+        slot,
+        error: String(e?.message || e),
+        key: e.key,
+        attemptedSize: e.attemptedSize,
+        gotType: e.gotType,
+        gotPreview: e.gotPreview,
+      });
+    }
     return res.status(200).json({ ok: false, ymd, slot, error: String(e?.message || e) });
   }
 }
