@@ -1,11 +1,9 @@
 // pages/api/debug/kv.js
-// Uses REST (Upstash/Vercel KV) – no extra deps
+// Read any KV key via REST (Upstash/Vercel KV compatible)
 
 function kvEnv() {
-  const url =
-    process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
-  const token =
-    process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
+  const url = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
   if (!url || !token) throw new Error('KV env missing');
   return { url, token };
 }
@@ -15,10 +13,7 @@ async function kvGet(key) {
   const r = await fetch(`${url}/get/${encodeURIComponent(key)}?token=${token}`);
   const j = await r.json();
   let v = j?.result ?? null;
-  // Try JSON decode (arrays/objects stored as strings)
-  if (typeof v === 'string') {
-    try { v = JSON.parse(v); } catch (_) {}
-  }
+  if (typeof v === 'string') { try { v = JSON.parse(v); } catch (_) {} }
   return v;
 }
 
@@ -29,16 +24,13 @@ export default async function handler(req, res) {
 
     const value = await kvGet(key);
     const isArray = Array.isArray(value);
-    const url =
-      process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
+    const url = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
 
     return res.status(200).json({
       ok: true,
       kv: {
         url,
-        hasToken: Boolean(
-          process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN
-        ),
+        hasToken: Boolean(process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN),
         inspectedKey: key,
         isArray: isArray ? 1 : 0,
         value,
