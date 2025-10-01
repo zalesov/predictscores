@@ -1,20 +1,20 @@
 // pages/api/cron/rebuild.js
-// Collect today's fixtures from API-FOOTBALL and write:
+// Builds today's snapshot and union from API-FOOTBALL and stores them in KV.
+// Writes (always, even if empty):
 //   vb:day:<ymd>:snapshot:index  -> { ymd, slot, ts, chunks, size }
 //   vb:day:<ymd>:snapshot:<i>    -> [fixtureIds...]
 //   vb:day:<ymd>:union           -> [fixtureIds...]
 //
-// Robust KV writes (Upstash REST path, JSON, and pipeline fallbacks) + verified.
-// Enforces per-slot API-Football caps (AM=2000, PM=3000, LATE=1000) without
-// bricking on KV transient write failures.
-//
-// No extra deps.
+// Fixes:
+// - Uses the working query: ?date=<YMD>&timezone=Europe/Belgrade&page=<n>
+// - Robust KV writes (path, JSON, pipeline; Authorization + token) with verification
+// - Per-slot API call ceilings (AM=2000, PM=3000, LATE=1000) with best-effort counter
 
 const API_HOST = 'https://v3.football.api-sports.io';
+const API_HINTS = ['api-sports.io', 'api-football'];
 
 // ---- Slot caps ----
 const SLOT_CAPS = { am: 2000, pm: 3000, late: 1000 };
-const API_HOST_HINTS = ['api-sports.io', 'api-football'];
 
 // ---------- KV helpers (robust) ----------
 function kvEnv() {
@@ -27,18 +27,18 @@ function kvEnv() {
 async function kvGet(key) {
   const { url, token } = kvEnv();
 
-  // Try path GET with token query
+  // 1) Path GET with token query
   try {
     const r = await fetch(`${url}/get/${encodeURIComponent(key)}?token=${token}`);
     if (r.ok) {
       const j = await r.json();
       let v = j?.result ?? null;
-      if (typeof v === 'string') { try { v = JSON.parse(v); } catch (_) {} }
+      if (typeof v === 'string') { try { v = JSON.parse(v); } catch(_){} }
       return v;
     }
-  } catch (_) {}
+  } catch(_) {}
 
-  // Try pipeline GET with Authorization header
+  // 2) Pipeline GET with Authorization header
   try {
     const r2 = await fetch(`${url}/pipeline`, {
       method: 'POST',
@@ -46,37 +46,38 @@ async function kvGet(key) {
       body: JSON.stringify([['GET', key]]),
     });
     if (r2.ok) {
-      const arr = await r2.json(); // e.g., [ { result: "..." } ]
+      const arr = await r2.json();
       let v = arr?.[0]?.result ?? null;
-      if (typeof v === 'string') { try { v = JSON.parse(v); } catch (_) {} }
+      if (typeof v === 'string') { try { v = JSON.parse(v); } catch(_){} }
       return v;
     }
-  } catch (_) {}
+  } catch(_) {}
 
   return null;
 }
 
 async function kvSetVerified(key, value) {
   const { url, token } = kvEnv();
-  const valStr = typeof value === 'string' ? value : JSON.stringify(value);
+  const val = typeof value === 'string' ? value : JSON.stringify(value);
 
-  // 1) Path-style SET with token query
   let ok = false;
-  try {
-    const r1 = await fetch(`${url}/set/${encodeURIComponent(key)}/${encodeURIComponent(valStr)}?token=${token}`, { method: 'POST' });
-    ok = r1.ok;
-  } catch (_) {}
 
-  // 2) JSON body /set with token query (Upstash variant)
+  // 1) JSON body /set with Authorization header
+  try {
+    const r = await fetch(`${url}/set`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'authorization': `Bearer ${token}` },
+      body: JSON.stringify({ key, value: val }),
+    });
+    ok = r.ok;
+  } catch(_) {}
+
+  // 2) Path-style SET with token query
   if (!ok) {
     try {
-      const r2 = await fetch(`${url}/set?token=${token}`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ key, value: valStr }),
-      });
+      const r2 = await fetch(`${url}/set/${encodeURIComponent(key)}/${encodeURIComponent(val)}?token=${token}`, { method: 'POST' });
       ok = r2.ok;
-    } catch (_) {}
+    } catch(_) {}
   }
 
   // 3) Pipeline SET with Authorization header
@@ -85,23 +86,23 @@ async function kvSetVerified(key, value) {
       const r3 = await fetch(`${url}/pipeline`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'authorization': `Bearer ${token}` },
-        body: JSON.stringify([['SET', key, valStr]]),
+        body: JSON.stringify([['SET', key, val]]),
       });
       ok = r3.ok;
-    } catch (_) {}
+    } catch(_) {}
   }
 
   if (!ok) throw new Error(`KV_SET_FAILED:${key}`);
 
   // Verify
   const got = await kvGet(key);
-  const expected = typeof value === 'string' ? value : JSON.parse(valStr);
+  const expected = typeof value === 'string' ? value : JSON.parse(val);
   const eq = JSON.stringify(got) === JSON.stringify(expected);
   if (!eq) throw new Error(`KV_VERIFY_FAILED:${key}`);
   return true;
 }
 
-// ---------- time/slot ----------
+// ---------- time & slot ----------
 function ymdFromTZ(tz = 'Europe/Belgrade') {
   const d = new Date(new Date().toLocaleString('en-US', { timeZone: tz }));
   const yyyy = d.getFullYear();
@@ -109,32 +110,30 @@ function ymdFromTZ(tz = 'Europe/Belgrade') {
   const dd = String(d.getDate()).padStart(2, '0');
   return `${yyyy}-${mm}-${dd}`;
 }
-function slotByHour(h){ if(h<12)return'am'; if(h<17)return'pm'; return'late'; }
+function slotByHour(h){ if (h < 12) return 'am'; if (h < 17) return 'pm'; return 'late'; }
 function detectSlot(tz='Europe/Belgrade'){
-  const h = Number(new Date(new Date().toLocaleString('en-US',{timeZone:tz})).getHours());
+  const h = Number(new Date(new Date().toLocaleString('en-US',{ timeZone: tz })).getHours());
   return slotByHour(h);
 }
+
+// ---------- per-slot cap counter (best-effort) ----------
 function spentKey(ymd, slot){ return `afc:spent:${ymd}:${slot}`; }
 function capFor(slot){ return SLOT_CAPS[slot] ?? 2000; }
 
-// ---------- counted fetch for API-FOOTBALL (non-fatal on counter write error) ----------
 async function countedFetch(url, opts, { ymd, slot }) {
   const u = typeof url === 'string' ? url : String(url?.url || url);
-  const isApi = API_HOST_HINTS.some(h => u.includes(h));
-
+  const isApi = API_HINTS.some(h => u.includes(h));
   if (!isApi) return fetch(url, opts);
 
-  // Read spent (best-effort)
+  // Read current spent (best-effort)
   let spent = 0;
-  try { spent = Number((await kvGet(spentKey(ymd,slot))) || 0); } catch (_) {}
-
+  try { spent = Number((await kvGet(spentKey(ymd, slot))) || 0); } catch(_) {}
   if (spent >= capFor(slot)) throw new Error(`CAP_REACHED:${slot}:${spent}/${capFor(slot)}`);
 
   const resp = await fetch(url, opts);
 
-  // Increment (best-effort; do not brick on KV hiccup)
-  try { await kvSetVerified(spentKey(ymd,slot), spent + 1); } catch (_) { /* ignore */ }
-
+  // Increment (best-effort; do not brick run if KV hiccups)
+  try { await kvSetVerified(spentKey(ymd, slot), spent + 1); } catch(_) {}
   return resp;
 }
 
@@ -146,7 +145,7 @@ async function fetchFixturesForDate(ymd, { ymdSlot, tracker }) {
   let page = 1;
   const ids = [];
   while (true) {
-    const url = `${API_HOST}/fixtures?from=${ymd}&to=${ymd}&timezone=Europe/Belgrade&page=${page}`;
+    const url = `${API_HOST}/fixtures?date=${ymd}&timezone=Europe/Belgrade&page=${page}`;
     tracker.last_url = url;
     const resp = await countedFetch(url, { headers: { 'x-apisports-key': key } }, ymdSlot);
     tracker.http = resp.status;
@@ -163,7 +162,7 @@ async function fetchFixturesForDate(ymd, { ymdSlot, tracker }) {
     const total = Number(data?.paging?.total || 1);
     if (cur >= total) break;
     page++;
-    if (page > 50) break; // hard safety
+    if (page > 50) break; // safety
   }
   return Array.from(new Set(ids));
 }
@@ -183,22 +182,23 @@ export default async function handler(req, res) {
   const ymdSlot = { ymd, slot };
 
   try {
-    // 1) Collect fixtures
+    // 1) Collect fixture IDs for today (Europe/Belgrade)
     const ids = await fetchFixturesForDate(ymd, { ymdSlot, tracker });
 
-    // 2) Write snapshot chunks (write index + union even if empty, for visibility)
+    // 2) Write snapshot chunks (even if empty)
     const chunks = chunkArray(ids, 350);
     for (let i = 0; i < chunks.length; i++) {
       await kvSetVerified(`vb:day:${ymd}:snapshot:${i}`, chunks[i]);
     }
 
-    // 3) Write snapshot index
+    // 3) Write snapshot index (always)
     const indexObj = { ymd, slot, ts, chunks: chunks.length, size: ids.length };
     await kvSetVerified(`vb:day:${ymd}:snapshot:index`, indexObj);
 
-    // 4) Write union
+    // 4) Write union (always)
     await kvSetVerified(`vb:day:${ymd}:union`, ids);
 
+    // Done
     return res.status(200).json({
       ok: true,
       ymd, slot, ts,
