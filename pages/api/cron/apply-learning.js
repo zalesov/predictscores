@@ -1,110 +1,104 @@
 // pages/api/cron/apply-learning.js
-// KV-only: reads UNION, joins snapshot if available, writes vbl_full:<ymd>:<slot> + day, and freshness markers.
-// ZERO external API calls.
+// Reads union and writes vbl_full:* in the unified KV
 
-export const config = { api: { bodyParser:false } };
-
-/* ---------- TZ & slot ---------- */
-function belgradeYMD(d=new Date()){ try{ return new Intl.DateTimeFormat("en-CA",{timeZone:"Europe/Belgrade"}).format(d);}catch{return new Intl.DateTimeFormat("en-CA").format(d);} }
-function inferSlotByTime(d=new Date()){
-  const [H]=new Intl.DateTimeFormat("en-GB",{timeZone:"Europe/Belgrade",hour:"2-digit",minute:"2-digit",hour12:false}).format(d).split(":").map(Number);
-  if(H<10) return "late"; if(H<15) return "am"; return "pm";
+function resolveKV() {
+  const url = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
+  if (!url || !token) throw new Error('KV env missing');
+  return { url, token };
+}
+async function kvGet(key) {
+  const { url, token } = resolveKV();
+  try {
+    const r = await fetch(`${url}/get/${encodeURIComponent(key)}?token=${token}`);
+    if (r.ok) {
+      const j = await r.json();
+      let v = j?.result ?? null;
+      if (typeof v === 'string') { try { v = JSON.parse(v); } catch(_){} }
+      return v;
+    }
+  } catch(_) {}
+  try {
+    const r2 = await fetch(`${url}/pipeline`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'authorization': `Bearer ${token}` },
+      body: JSON.stringify([['GET', key]]),
+    });
+    if (r2.ok) {
+      const arr = await r2.json();
+      let v = arr?.[0]?.result ?? null;
+      if (typeof v === 'string') { try { v = JSON.parse(v); } catch(_){} }
+      return v;
+    }
+  } catch(_) {}
+  return null;
+}
+async function kvSetVerified(key, value) {
+  const { url, token } = resolveKV();
+  const val = typeof value === 'string' ? value : JSON.stringify(value);
+  let ok=false;
+  try {
+    const r = await fetch(`${url}/set`, {
+      method:'POST', headers:{'content-type':'application/json','authorization':`Bearer ${token}`},
+      body: JSON.stringify({ key, value: val }),
+    });
+    ok = r.ok;
+  } catch(_){}
+  if (!ok) {
+    try {
+      const r2 = await fetch(`${url}/set/${encodeURIComponent(key)}/${encodeURIComponent(val)}?token=${token}`, { method:'POST' });
+      ok = r2.ok;
+    } catch(_){}
+  }
+  if (!ok) {
+    try {
+      const r3 = await fetch(`${url}/pipeline`, {
+        method:'POST', headers:{'content-type':'application/json','authorization':`Bearer ${token}`},
+        body: JSON.stringify([['SET', key, val]]),
+      });
+      ok = r3.ok;
+    } catch(_){}
+  }
+  if (!ok) throw new Error(`KV_SET_FAILED:${key}`);
+  const got = await kvGet(key);
+  const exp = typeof value==='string'? value : JSON.parse(val);
+  if (JSON.stringify(got)!==JSON.stringify(exp)) throw new Error(`KV_VERIFY_FAILED:${key}`);
+  return true;
 }
 
-/* ---------- KV ---------- */
-const KV_URL=process.env.KV_REST_API_URL?String(process.env.KV_REST_API_URL).replace(/\/+$/,""):"";
-const KV_TOK=process.env.KV_REST_API_TOKEN||"";
-const hasKV=Boolean(KV_URL&&KV_TOK);
-const R_URL=process.env.UPSTASH_REDIS_REST_URL?String(process.env.UPSTASH_REDIS_REST_URL).replace(/\/+$/,""):"";
-const R_TOK=process.env.UPSTASH_REDIS_REST_TOKEN||"";
-const hasR=Boolean(R_URL&&R_TOK);
-const J=s=>{try{return JSON.parse(String(s??""));}catch{return null;}};
-async function kvGetREST(k){ if(!hasKV) return null; const r=await fetch(`${KV_URL}/get/${encodeURIComponent(k)}`,{headers:{Authorization:`Bearer ${KV_TOK}`},cache:"no-store"}); if(!r.ok) return null; const j=await r.json().catch(()=>null); return typeof j?.result==="string"?j.result:null; }
-async function kvSetREST(k,v){ if(!hasKV) return false; const r=await fetch(`${KV_URL}/set/${encodeURIComponent(k)}`,{method:"POST",headers:{Authorization:`Bearer ${KV_TOK}`,"Content-Type":"application/json"},body:typeof v==="string"?v:JSON.stringify(v)}); return r.ok; }
-async function kvGetUp(k){ if(!hasR) return null; const r=await fetch(`${R_URL}/get/${encodeURIComponent(k)}`,{headers:{Authorization:`Bearer ${R_TOK}`},cache:"no-store"}); if(!r.ok) return null; const j=await r.json().catch(()=>null); return typeof j?.result==="string"?j.result:null; }
-async function kvSetUp(k,v){ if(!hasR) return false; const r=await fetch(`${R_URL}/set/${encodeURIComponent(k)}`,{method:"POST",headers:{Authorization:`Bearer ${R_TOK}`,"Content-Type":"application/json"},body:typeof v==="string"?v:JSON.stringify(v)}); return r.ok; }
-const kvGetAny=(k)=>kvGetREST(k).then(v=>v!=null?v:kvGetUp(k));
-const kvSetBoth=(k,v)=>Promise.all([kvSetREST(k,v),kvSetUp(k,v)]).then(([a,b])=>a||b);
-
-/* ---------- helpers ---------- */
-const idsFrom = raw => { const v=typeof raw==="string"?(J(raw)??raw):raw; if(!v) return []; if(Array.isArray(v)) return v.filter(Boolean); if(Array.isArray(v.items)) return v.items.filter(Boolean); return []; };
-const rowsFrom = raw => { const v=typeof raw==="string"?(J(raw)??raw):raw; if(!v) return []; if(Array.isArray(v)) return v; if(Array.isArray(v.items)) return v.items; return []; };
-const fxId = r => r?.id ?? r?.fixture_id ?? r?.fixture?.id ?? null;
-
-async function loadSnapshotRows(ymd){
-  const idxKey=`vb:day:${ymd}:snapshot:index`, legKey=`vb:day:${ymd}:snapshot`;
-  const idxRaw=await kvGetAny(idxKey); const idx=typeof idxRaw==="string"?(J(idxRaw)??idxRaw):idxRaw;
-  if(idx && Array.isArray(idx.items)) return idx.items;
-  if(Array.isArray(idx) && idx.length && typeof idx[0]==="object") return idx;
-  let chunkKeys=[];
-  if(typeof idx==="string" && idx!==idxKey) chunkKeys=[idx];
-  else if(idx && Array.isArray(idx.chunks)) chunkKeys=idx.chunks.filter(Boolean);
-  else if(Array.isArray(idx) && idx.length && typeof idx[0]==="string") chunkKeys=idx.filter(Boolean);
-  const rows=[]; for(const ck of chunkKeys){ if(ck===idxKey) continue; const cRaw=await kvGetAny(ck); rows.push(...rowsFrom(cRaw)); }
-  if(rows.length) return rows;
-  const legRaw=await kvGetAny(legKey); const legacy=rowsFrom(legRaw);
-  return legacy;
+function ymdFromTZ(tz='Europe/Belgrade'){
+  const d=new Date(new Date().toLocaleString('en-US',{timeZone:tz}));
+  const y=d.getFullYear(), m=String(d.getMonth()+1).padStart(2,'0'), dd=String(d.getDate()).padStart(2,'0');
+  return `${y}-${m}-${dd}`;
 }
+function slotByHour(h){ if(h<12)return'am'; if(h<17)return'pm'; return'late'; }
+function detectSlot(tz='Europe/Belgrade'){ const h=Number(new Date(new Date().toLocaleString('en-US',{timeZone:tz})).getHours()); return slotByHour(h); }
 
-/* ---------- handler ---------- */
 export default async function handler(req,res){
   try{
-    if(!hasKV && !hasR) return res.status(200).json({ok:false,error:"No KV configured."});
+    const tz='Europe/Belgrade';
+    const ymd=(req.query.ymd||'').match(/^\d{4}-\d{2}-\d{2}$/)?req.query.ymd:ymdFromTZ(tz);
+    const slot=(req.query.slot||'').match(/^(am|pm|late)$/)?req.query.slot:detectSlot(tz);
 
-    const now=new Date();
-    const ymd=String(req.query.ymd||belgradeYMD(now));
-    const qSlot=String(req.query.slot||"").toLowerCase();
-    const slot=(qSlot==="am"||qSlot==="pm"||qSlot==="late")?qSlot:inferSlotByTime(now);
-
-    const unionKey=`vb:day:${ymd}:union`;
+    const sourceKey=`vb:day:${ymd}:union`;
+    const union=(await kvGet(sourceKey))||[];
+    const items=Array.isArray(union)?union:[];
     const vblSlotKey=`vbl_full:${ymd}:${slot}`;
-    const vblDayKey =`vbl_full:${ymd}`;
+    const vblDayKey=`vbl_full:${ymd}`;
     const historyKey=`vb:history:${ymd}`;
-    const lockKey   =`vb:day:${ymd}:last`;
-    const vbHitDay  =`vb-locked:kv:hit:${ymd}`;
-    const vbHit     =`vb-locked:kv:hit`;
+    const lockKey=`vb:day:${ymd}:last`;
+    const vbHit='vb-locked:kv:hit';
+    const vbHitDay=`${vbHit}:${ymd}`;
 
-    const unionRaw=await kvGetAny(unionKey);
-    const ids=idsFrom(unionRaw);
+    // Your existing scoring/learning can sit here; we just forward the union for now:
+    await kvSetVerified(vblSlotKey, items);
+    await kvSetVerified(vblDayKey, items);
+    await kvSetVerified(lockKey, items);
+    await kvSetVerified(historyKey, { ymd, slot, count: items.length, ts: new Date().toISOString() });
+    await kvSetVerified(vbHit, true);
+    await kvSetVerified(vbHitDay, true);
 
-    let items=[];
-    if(ids.length){
-      const snapRows=await loadSnapshotRows(ymd);
-      if(snapRows.length){
-        const want=new Set(ids);
-        for(const r of snapRows){ const id=fxId(r); if(id==null || !want.has(id)) continue; items.push(r); }
-      }
-      if(!items.length) items = ids.slice(); // fall back to ids-only payload
-    }
-
-    const ts=new Date().toISOString();
-    await kvSetBoth(vblSlotKey,{ ymd, slot, ts, items });
-
-    // merge into day
-    let dayItems=items;
-    const prevDayRaw=await kvGetAny(vblDayKey);
-    if(prevDayRaw){
-      const prev=J(prevDayRaw);
-      if(prev && Array.isArray(prev.items)){
-        const seen=new Map();
-        const add=x=>{ const k=typeof x==="object"?(fxId(x)??JSON.stringify(x)):String(x); if(!seen.has(k)) seen.set(k,x); };
-        prev.items.forEach(add); dayItems.forEach(add);
-        dayItems=Array.from(seen.values());
-      }
-    }
-    await kvSetBoth(vblDayKey,{ ymd, ts, items:dayItems });
-
-    await kvSetBoth(historyKey,{ ymd, ts, slot, count:Array.isArray(items)?items.length:0 });
-    await kvSetBoth(lockKey,   { ymd, ts, last_slot:slot, count:Array.isArray(items)?items.length:0 });
-
-    const marker={ ymd, ts, last_odds_refresh: ts, items:Array.isArray(items)?items.length:0 };
-    await Promise.all([ kvSetBoth(vbHitDay,marker), kvSetBoth(vbHit,marker) ]);
-
-    return res.status(200).json({
-      ok:true, ymd, slot, count:Array.isArray(items)?items.length:0,
-      wrote:{ vblSlotKey, vblDayKey, historyKey, lockKey, vbHitDay, vbHit },
-      sourceKey: unionKey
-    });
+    return res.status(200).json({ ok:true, ymd, slot, count: items.length, wrote: { vblSlotKey, vblDayKey, historyKey, lockKey, vbHitDay, vbHit }, sourceKey });
   }catch(e){
     return res.status(200).json({ ok:false, error:String(e?.message||e) });
   }
