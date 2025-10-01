@@ -1,87 +1,70 @@
 // pages/api/value-bets-locked.js
-// KV-only feed. Reads vbl_full:<ymd>:<slot> (fallback vbl_full:<ymd>).
-// Enforces fixed slot caps regardless of query.
-// Weekdays: AM=15, PM=15, LATE=6; Weekends: AM=20, PM=20, LATE=6.
+// Vraća zaključanu listu i meta; ne troši AF pozive.
 
-export const config = { api: { bodyParser:false } };
-
-/* ---------- date/slot ---------- */
-function belgradeYMD(d=new Date()){ try{ return new Intl.DateTimeFormat("en-CA",{timeZone:"Europe/Belgrade"}).format(d);}catch{return new Intl.DateTimeFormat("en-CA").format(d);} }
-function inferSlotByTime(d=new Date()){
-  const [H]=new Intl.DateTimeFormat("en-GB",{timeZone:"Europe/Belgrade",hour:"2-digit",minute:"2-digit",hour12:false}).format(d).split(":").map(Number);
-  if(H<10) return "late"; if(H<15) return "am"; return "pm";
+function resolveKV() {
+  const url = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
+  if (!url || !token) throw new Error('KV env missing');
+  return { url, token };
 }
-function parseDate(ymd){ const [y,m,d]=ymd.split("-").map(Number); return new Date(Date.UTC(y,m-1,d,12,0,0)); }
-function isWeekendYMD(ymd){
-  const d=parseDate(ymd);
-  const wd=new Intl.DateTimeFormat("en-GB",{timeZone:"Europe/Belgrade",weekday:"long"}).format(d);
-  return wd==="Saturday"||wd==="Sunday";
+async function kvPipeline(cmds) {
+  const { url, token } = resolveKV();
+  const r = await fetch(`${url}/pipeline`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+    body: JSON.stringify(cmds),
+  });
+  if (!r.ok) throw new Error(`KV_PIPELINE_HTTP_${r.status}`);
+  return r.json();
 }
-function capsFor(ymd,slot){
-  const wknd=isWeekendYMD(ymd);
-  const base = wknd ? { am:20, pm:20, late:6 } : { am:15, pm:15, late:6 };
-  // allow env override
-  const num = (k,def)=>{ const v=process.env[k]; const n=Number(v); return Number.isFinite(n)&&n>0?n:def; };
-  return wknd
-    ? (slot==="am"?num("VBL_CAP_WEEKEND_AM",base.am):slot==="pm"?num("VBL_CAP_WEEKEND_PM",base.pm):num("VBL_CAP_WEEKEND_LATE",base.late))
-    : (slot==="am"?num("VBL_CAP_WEEKDAY_AM",base.am):slot==="pm"?num("VBL_CAP_WEEKDAY_PM",base.pm):num("VBL_CAP_WEEKDAY_LATE",base.late));
+async function kvGet(key) {
+  try {
+    const arr = await kvPipeline([['GET', key]]);
+    let v = arr?.[0]?.result ?? null;
+    if (typeof v === 'string') { try { v = JSON.parse(v); } catch {} }
+    return v;
+  } catch { return null; }
 }
 
-/* ---------- KV ---------- */
-const KV_URL=process.env.KV_REST_API_URL?String(process.env.KV_REST_API_URL).replace(/\/+$/,""):"";
-const KV_TOK=process.env.KV_REST_API_TOKEN||"";
-const hasKV=Boolean(KV_URL&&KV_TOK);
-const R_URL=process.env.UPSTASH_REDIS_REST_URL?String(process.env.UPSTASH_REDIS_REST_URL).replace(/\/+$/,""):"";
-const R_TOK=process.env.UPSTASH_REDIS_REST_TOKEN||"";
-const hasR=Boolean(R_URL&&R_TOK);
-const J=s=>{try{return JSON.parse(String(s??""));}catch{return null;}};
-async function kvGetREST(k){ if(!hasKV) return null; const r=await fetch(`${KV_URL}/get/${encodeURIComponent(k)}`,{headers:{Authorization:`Bearer ${KV_TOK}`},cache:"no-store"}); if(!r.ok) return null; const j=await r.json().catch(()=>null); return typeof j?.result==="string"?j.result:null; }
-async function kvGetUp(k){ if(!hasR) return null; const r=await fetch(`${R_URL}/get/${encodeURIComponent(k)}`,{headers:{Authorization:`Bearer ${R_TOK}`},cache:"no-store"}); if(!r.ok) return null; const j=await r.json().catch(()=>null); return typeof j?.result==="string"?j.result:null; }
-const kvGetAny=(k)=>kvGetREST(k).then(v=>v!=null?v:kvGetUp(k));
+function ymdFromTZ(tz='Europe/Belgrade'){
+  const d = new Date(new Date().toLocaleString('en-US',{ timeZone: tz }));
+  const y=d.getFullYear(), m=String(d.getMonth()+1).padStart(2,'0'), dd=String(d.getDate()).padStart(2,'0');
+  return `${y}-${m}-${dd}`;
+}
+function slotByHour(h){ if(h<12)return'am'; if(h<17)return'pm'; return'late'; }
+function detectSlot(tz='Europe/Belgrade'){ const h=Number(new Date(new Date().toLocaleString('en-US',{timeZone:tz})).getHours()); return slotByHour(h); }
 
-/* ---------- utils ---------- */
-const rowsFrom = raw => { const v=typeof raw==="string"?(J(raw)??raw):raw; if(!v) return []; if(Array.isArray(v)) return v; if(Array.isArray(v.items)) return v.items; return []; };
-
-/* ---------- handler ---------- */
 export default async function handler(req,res){
   try{
-    if(!hasKV && !hasR) return res.status(200).json({ items:[], meta:{ ymd:String(req.query.ymd||belgradeYMD()), slot:String(req.query.slot||""), source:"vb-locked:kv:hit", ts:null, last_odds_refresh:null }, error:"No KV configured." });
+    const tz='Europe/Belgrade';
+    const ymd=(req.query.ymd||'').match(/^\d{4}-\d{2}-\d{2}$/)?req.query.ymd:ymdFromTZ(tz);
+    const slot=(req.query.slot||'').match(/^(am|pm|late)$/)?req.query.slot:detectSlot(tz);
+    const slim = String(req.query.slim||'0') === '1';
 
-    const now=new Date();
-    const ymd=String(req.query.ymd||belgradeYMD(now));
-    const qSlot=String(req.query.slot||"").toLowerCase();
-    const slot=(qSlot==="am"||qSlot==="pm"||qSlot==="late")?qSlot:inferSlotByTime(now);
+    // Locked lista + meta
+    const listKey = 'vb-locked:kv:hit';
+    const metaKey = 'vb-locked:kv:hit:meta';
+    const items = (await kvGet(listKey)) || [];
+    const metaRaw = (await kvGet(metaKey)) || null;
 
-    const vblSlotKey=`vbl_full:${ymd}:${slot}`;
-    const vblDayKey =`vbl_full:${ymd}`;
-    const [slotRaw, dayRaw, ftRaw, fgRaw] = await Promise.all([
-      kvGetAny(vblSlotKey),
-      kvGetAny(vblDayKey),
-      kvGetAny(`vb-locked:kv:hit:${ymd}`),
-      kvGetAny(`vb-locked:kv:hit`)
-    ]);
+    // Synthetizuj meta kad nedostaje (da UI ne ostane prazan)
+    const nowIso = new Date().toISOString();
+    const meta = {
+      ymd,
+      slot,
+      source: 'vb-locked:kv:hit',
+      ts: metaRaw?.ts || nowIso,
+      last_odds_refresh: metaRaw?.last_odds_refresh || nowIso,
+      returned: Array.isArray(items) ? Math.min(items.length, 15) : 0,
+      cap: 15,
+    };
 
-    let items = rowsFrom(slotRaw);
-    if (!items.length) items = rowsFrom(dayRaw);
+    const payload = slim
+      ? { items: Array.isArray(items) ? items.slice(0, 15) : [], meta }
+      : { items, meta };
 
-    // enforce caps regardless of client-provided ?limit
-    const cap = capsFor(ymd, slot);
-    if (items.length > cap) items = items.slice(0, cap);
-
-    const ft = J(ftRaw) || {};
-    const fg = J(fgRaw) || {};
-    const ts = ft.ts || fg.ts || null;
-    const last_odds_refresh = ft.last_odds_refresh || fg.last_odds_refresh || null;
-
-    return res.status(200).json({
-      items,
-      meta:{ ymd, slot, source:"vb-locked:kv:hit", ts, last_odds_refresh, returned: items.length, cap }
-    });
+    return res.status(200).json(payload);
   }catch(e){
-    return res.status(200).json({
-      items:[],
-      meta:{ ymd:String(req.query.ymd||belgradeYMD()), slot:String(req.query.slot||""), source:"vb-locked:kv:hit", ts:null, last_odds_refresh:null },
-      error:String(e?.message||e)
-    });
+    return res.status(200).json({ ok:false, error:String(e?.message||e) });
   }
 }
