@@ -1,8 +1,10 @@
 // pages/api/cron/rebuild.js
-// Snapshot kolektor: fixtures za Belgrade dan -> snapshot chunks, index, union.
-// ALL-WEATHER: uvek upisuje index i union (i kad je prazno).
-// Jedinstveni KV klijent (Upstash /pipeline + Bearer), verifikacija posle svakog SET-a.
-// Slot capovi: AM=2000, PM=3000, LATE=1000 (best-effort brojač).
+// Snapshot kolektor za današnji (YMD) Belgrade dan:
+// - čita fixturе iz API-FOOTBALL preko ?date=<YMD>&timezone=Europe/Belgrade&page=n
+// - striktno detektuje API greške (i kad vraća 200 sa errors.token)
+// - UVEK upisuje snapshot:index i union kad je uspešno (čak i kad je lista prazna)
+// - Poštuje per-slot capove: AM=2000, PM=3000, LATE=1000 (brojač best-effort)
+// - Jedinstveni KV klijent (Upstash /pipeline + Bearer), verifikacija posle SET-a
 
 const API_HOST = 'https://v3.football.api-sports.io';
 const SLOT_CAPS = { am: 2000, pm: 3000, late: 1000 };
@@ -78,15 +80,18 @@ async function countedFetch(url, opts, { ymd, slot }) {
 
   let spent = Number((await kvGet(spentKey(ymd, slot))) || 0);
   if (spent >= capFor(slot)) throw new Error(`CAP_REACHED:${slot}:${spent}/${capFor(slot)}`);
+
   const resp = await fetch(url, opts);
+
   // best-effort inkrement – i ako KV ne primi, ne blokiramo kolektor
   try { await kvSetVerified(spentKey(ymd, slot), spent + 1); } catch {}
   return resp;
 }
 
-/* ---------- kolektor fixtura ---------- */
-async function fetchFixturesForDate(ymd, ymdSlot, tracker) {
-  const key = process.env.API_FOOTBALL_KEY || process.env.NEXT_PUBLIC_API_FOOTBALL_KEY;
+/* ---------- kolektor fixtura (sa eksplicitnom detekcijom API errors) ---------- */
+async function fetchFixturesForDate(ymd, { ymd: y, slot }, tracker) {
+  const keyRaw = process.env.API_FOOTBALL_KEY || process.env.NEXT_PUBLIC_API_FOOTBALL_KEY;
+  const key = (keyRaw || '').trim();
   if (!key) throw new Error('API_FOOTBALL_KEY missing');
 
   let page = 1;
@@ -94,13 +99,37 @@ async function fetchFixturesForDate(ymd, ymdSlot, tracker) {
   while (true) {
     const url = `${API_HOST}/fixtures?date=${ymd}&timezone=Europe/Belgrade&page=${page}`;
     tracker.last_url = url;
-    const resp = await countedFetch(url, { headers: { 'x-apisports-key': key } }, ymdSlot);
+
+    const resp = await countedFetch(
+      url,
+      {
+        method: 'GET',
+        headers: {
+          'x-apisports-key': key,         // <— OBAVEZNO: header sa ključem
+          'accept': 'application/json'
+        },
+        cache: 'no-store'
+      },
+      { ymd: y, slot }
+    );
+
     tracker.http = resp.status;
-    if (!resp.ok) throw new Error(`AF fixtures HTTP ${resp.status}`);
     const data = await resp.json();
 
-    const rows = Array.isArray(data?.response) ? data.response : [];
-    for (const it of rows) {
+    // --- DETEKCIJA API "errors" (često vraća 200 sa errors.token) ---
+    if (data?.errors && Object.keys(data.errors).length > 0) {
+      const errMsg = Object.entries(data.errors)
+        .map(([k, v]) => `${k}:${typeof v === 'string' ? v : JSON.stringify(v)}`)
+        .join('; ');
+      throw new Error(`AF_ERRORS:${errMsg}`);
+    }
+
+    // defensive: očekujemo niz
+    if (!Array.isArray(data?.response)) {
+      throw new Error(`AF_SHAPE: response_not_array (${JSON.stringify(data).slice(0,160)}...)`);
+    }
+
+    for (const it of data.response) {
       const id = it?.fixture?.id;
       if (Number.isInteger(id)) ids.push(id);
     }
@@ -109,8 +138,9 @@ async function fetchFixturesForDate(ymd, ymdSlot, tracker) {
     const total = Number(data?.paging?.total || 1);
     if (cur >= total) break;
     page++;
-    if (page > 50) break; // hard safety
+    if (page > 50) break; // safety
   }
+
   return Array.from(new Set(ids));
 }
 
@@ -148,11 +178,7 @@ export default async function handler(req, res) {
       sample: ids.slice(0, 10),
     });
   } catch (e) {
-    // fallback: makar upiši PRAZAN index/union da više NIKAD ne bude null
-    try {
-      await kvSetVerified(`vb:day:${ymd}:snapshot:index`, { ymd, slot, ts, chunks: 0, size: 0 });
-      await kvSetVerified(`vb:day:${ymd}:union`, []);
-    } catch {}
+    // NEMA lažnog ok:true kad je token/shape problem: jasno prijavi grešku
     return res.status(200).json({
       ok: false,
       ymd, slot,
