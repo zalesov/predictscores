@@ -2,108 +2,121 @@ name: odds-watcher
 
 on:
   schedule:
-    # Svakog sata u :05 (UTC). Unutar job-a proveravamo Europe/Belgrade vreme
-    # i zovemo endpoint SAMO kada je 00, 10 ili 15h lokalno.
+    # run at :05 every hour (UTC); script decides whether to fire by Belgrade time
     - cron: '5 * * * *'
   workflow_dispatch:
     inputs:
       ymd:
-        description: 'YYYY-MM-DD (opciono, default je današnji u Europe/Belgrade)'
+        description: 'Override date (YYYY-MM-DD)'
         required: false
+        type: string
       slot:
-        description: 'late | am | pm (opciono, auto-izračun po Europe/Belgrade ako nije zadato)'
+        description: 'Slot: late | am | pm'
         required: false
+        type: choice
+        options: [late, am, pm]
       debug:
-        description: 'Set to 1 for debug response'
+        description: 'Append debug flag'
         required: false
-
-permissions:
-  contents: read
-
-concurrency:
-  group: odds-watcher
-  cancel-in-progress: true
+        type: boolean
 
 jobs:
   refresh-odds:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     env:
-      BASE_URL: ${{ secrets.BASE_URL }}
+      # Optional: set your public base URL via repo/env/Org secrets
+      BASE_URL: ${{ secrets.NEXT_PUBLIC_BASE_URL }}
+      # Optional: shared cron key if your API expects it
+      CRON_KEY: ${{ secrets.CRON_KEY }}
       TZ_REGION: Europe/Belgrade
+
     steps:
       - name: Compute Belgrade date/slot (or use inputs)
         id: calc
         shell: bash
+        env:
+          IN_YMD:  ${{ github.event.inputs.ymd }}
+          IN_SLOT: ${{ github.event.inputs.slot }}
+          IN_DBG:  ${{ github.event.inputs.debug }}
         run: |
           set -euo pipefail
 
-          # Ako su prosleđeni ručni inputi, koristi njih
-          IN_YMD="${{ github.event.inputs.ymd || '' }}"
-          IN_SLOT="${{ github.event.inputs.slot || '' }}"
-          IN_DEBUG="${{ github.event.inputs.debug || '' }}"
+          # Always define NOW_BG first so it's never "unbound"
+          NOW_BG="$(TZ="${TZ_REGION}" date -Iseconds)"
+          HOUR_BG="$(TZ="${TZ_REGION}" date +%H)"
 
-          if [ -n "$IN_YMD" ]; then
-            YMD="$IN_YMD"
-          else
-            YMD="$(TZ=$TZ_REGION date +%F)"
-          fi
+          # Inputs are optional; guard with :- to be safe under 'set -u'
+          YMD="${IN_YMD:-$(TZ="${TZ_REGION}" date +%F)}"
+          SLOT_IN="${IN_SLOT:-}"
 
-          if [ -n "$IN_SLOT" ]; then
-            SLOT="$IN_SLOT"
+          if [ -n "$SLOT_IN" ]; then
+            SLOT="$SLOT_IN"
           else
-            HOUR_BG="$(TZ=$TZ_REGION date +%H)"
-            if [ "$HOUR_BG" -lt 10 ]; then
-              SLOT="late"
-            elif [ "$HOUR_BG" -lt 15 ]; then
-              SLOT="am"
-            else
-              SLOT="pm"
+            # Auto slot by Belgrade hour
+            if   [ "$HOUR_BG" -lt 10 ]; then SLOT="late"
+            elif [ "$HOUR_BG" -lt 15 ]; then SLOT="am"
+            else                            SLOT="pm"
             fi
           fi
 
-          # Trigger samo kada je 00/10/15h lokalno (osim ako je ručni run)
-          if [ -n "$IN_SLOT" ] || [ -n "$IN_YMD" ]; then
+          # Optional debug flag (appended as &debug=1)
+          DBG=""
+          if [ "${IN_DBG:-false}" = "true" ]; then DBG="&debug=1"; fi
+
+          # Fire only at 00 / 10 / 15 Belgrade hours
+          TRIGGER="0"
+          if [ "$HOUR_BG" = "00" ] || [ "$HOUR_BG" = "10" ] || [ "$HOUR_BG" = "15" ]; then
             TRIGGER="1"
-          else
-            HOUR_BG_NOW="$(TZ=$TZ_REGION date +%H)"
-            case "$HOUR_BG_NOW" in
-              00|10|15) TRIGGER="1" ;;
-              *)        TRIGGER="0" ;;
-            esac
           fi
 
-          # Debug flag
-          if [ "$IN_DEBUG" = "1" ]; then
-            DBG="&debug=1"
-          else
-            DBG=""
-          fi
+          {
+            echo "NOW_BG=$NOW_BG"
+            echo "HOUR_BG=$HOUR_BG"
+            echo "YMD=$YMD"
+            echo "SLOT=$SLOT"
+            echo "DBG=$DBG"
+            echo "TRIGGER=$TRIGGER"
+          } >> "$GITHUB_ENV"
 
-          echo "YMD=$YMD"           >> "$GITHUB_ENV"
-          echo "SLOT=$SLOT"         >> "$GITHUB_ENV"
-          echo "TRIGGER=$TRIGGER"   >> "$GITHUB_ENV"
-          echo "DBG=$DBG"           >> "$GITHUB_ENV"
-          echo "NOW_BG=$(TZ=$TZ_REGION date '+%Y-%m-%d %H:%M:%S %Z')" >> "$GITHUB_ENV"
-
-          echo "Computed: YMD=$YMD SLOT=$SLOT NOW_BG=$NOW_BG TRIGGER=$TRIGGER"
+          echo "Computed (BG): NOW=$NOW_BG HOUR=$HOUR_BG YMD=$YMD SLOT=$SLOT TRIGGER=$TRIGGER"
 
       - name: Skip if not slot time (Belgrade)
-        if: env.TRIGGER != '1'
-        run: |
-          echo "Not a slot boundary in Europe/Belgrade (NOW=$NOW_BG). Skipping call."
-
-      - name: Call refresh-odds (once per slot)
-        if: env.TRIGGER == '1'
         shell: bash
         run: |
           set -euo pipefail
-          if [ -z "$BASE_URL" ]; then
-            echo "Missing BASE_URL secret"; exit 1
+          if [ "${TRIGGER:-0}" != "1" ]; then
+            echo "Not a slot hour in ${TZ_REGION} (HOUR_BG=${HOUR_BG:-n/a}). Skipping."
+            exit 0
           fi
 
-          URL="${BASE_URL%/}/api/cron/refresh-odds?ymd=${YMD}&slot=${SLOT}${DBG}"
-          echo "Calling: $URL (NOW_BG=$NOW_BG)"
-          # --fail: exit on HTTP >=400; --show-error: print error; --silent: cleaner logs
-          curl --fail --show-error --silent "$URL"
-          echo
+      - name: Call refresh-odds
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          URL_BASE="${BASE_URL:-https://predictscores.vercel.app}"
+          Q="slot=${SLOT}&ymd=${YMD}"
+
+          # Optional shared key if your API requires it
+          if [ -n "${CRON_KEY:-}" ]; then
+            # Use a generic 'key' param; adjust if your API expects a different name
+            Q="${Q}&key=${CRON_KEY}"
+          fi
+
+          # Optional debug flag carried from compute step
+          if [ -n "${DBG:-}" ]; then
+            Q="${Q}${DBG}"
+          fi
+
+          URL="${URL_BASE}/api/cron/refresh-odds?${Q}"
+          echo "Calling: ${URL} (NOW_BG=${NOW_BG:-n/a})"
+
+          # Fast-fail, silent on HTTP errors, with reasonable timeout
+          HTTP_CODE="$(curl -sS -w '%{http_code}' -o /tmp/resp.json --max-time 60 "${URL}")"
+          echo "HTTP ${HTTP_CODE}"
+          cat /tmp/resp.json || true
+
+          if [ "${HTTP_CODE}" -lt 200 ] || [ "${HTTP_CODE}" -ge 300 ]; then
+            echo "Request failed with HTTP ${HTTP_CODE}"
+            exit 1
+          fi
