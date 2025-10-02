@@ -1,7 +1,7 @@
 // pages/api/value-bets-locked.js
-// Vraća do 15 mečeva za slot: pune kartice + (ako postoje) odds/edge.
-// Ako nema games u locked feedu, dopunjava detalje iz vb:fixture:<id> (KV keš).
-// Uklanja Reserve/U/W lige i poštuje slot prozore. Nema eksternih API poziva.
+// Returns up to 15 matches for the current slot: full cards + (if present) odds/edge.
+// If locked full items are missing, it fills details from vb:fixture:<id> (KV cache only).
+// Filters out Reserve/U/W leagues and respects slot windows. No external API calls.
 
 import * as s from "../../lib/kv-read";
 
@@ -9,58 +9,30 @@ export const config = { api: { bodyParser: false } };
 
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 
-// Hard blacklist po league ID-u (opciono)
+// Optional hard blacklist by league ID
 const BLOCKED_LEAGUE_IDS = [
-  // npr: 128, 71,
+  // e.g.: 128, 71,
 ];
 
-// Regex blokovi po nazivu lige
-const RE_YOUTH = /\bU(?:23|22|21|20|19|18|17|16|15)\b/i;
-const RE_YOUTH_WORDS = /\b(under\s?(?:23|22|21|20|19|18|17|16|15)|primavera|youth|junior[es]?|sub\s?(?:23|22|21|20|19|18|17|16|15))\b/i;
-const RE_RESERVE = /\b(reserve|res\.|reserves)\b/i;
-const RE_WOMEN = new RegExp([
-  "\\bwomen'?s?\\b", "\\bfemeni\\w*\\b", "\\blad(?:y|ies)\\b",
-  "(?<!world)\\sW(\\s|\\b|[-)]|$)", "\\bW-?league\\b", "\\bW\\.?\\s?cup\\b"
-].join("|"), "i");
-
-function sval(x){ return (x==null) ? "" : String(x); }
-function isBlockedLeagueName(nameRaw){
-  const name = sval(nameRaw).trim();
-  if (!name) return false;
-  if (RE_WOMEN.test(name)) return true;
-  if (RE_YOUTH.test(name) || RE_YOUTH_WORDS.test(name)) return true;
-  if (RE_RESERVE.test(name)) return true;
+/* ---------------- utilities ---------------- */
+function isBlockedLeagueName(name) {
+  const n = String(name || "").toLowerCase();
+  // crude filters: women/reserve/u-xx
+  if (/\bu\d{2}\b/.test(n)) return true;
+  if (/(women|femin|ladies|female)/i.test(name || "")) return true;
+  if (/(reserve|reserves|b team|ii)$/.test(n)) return true;
   return false;
 }
-
-function ymdNow() {
-  const d = new Date(new Date().toLocaleString("en-US", { timeZone: TZ }));
-  const y = d.getFullYear(), m = String(d.getMonth() + 1).padStart(2, "0"), dd = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${dd}`;
+function hourInTZ(iso, tz = TZ) {
+  try {
+    const d = typeof iso === "string" ? new Date(iso) : iso;
+    return Number(new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", hour12: false }).format(d));
+  } catch { return NaN; }
 }
-function sanitizeYmd(v){
-  const sVal = decodeURIComponent(String(v || "")).trim(); 
-  return /^\d{4}-\d{2}-\d{2}$/.test(sVal) ? sVal : ymdNow();
-}
-function detectSlot(){
-  const h = Number(new Date(new Date().toLocaleString("en-US", { timeZone: TZ })).getHours());
-  if (h < 10) return "late";
-  if (h < 15) return "am";
-  return "pm";
-}
-function sanitizeSlot(v){
-  const sVal = decodeURIComponent(String(v || "")).trim().toLowerCase();
-  return /^(am|pm|late)$/.test(sVal) ? sVal : detectSlot();
-}
-function hourFromIsoLocal(iso) {
-  if (typeof iso !== "string") return null;
-  const m = iso.match(/T(\d{2}):(\d{2})/);
-  return m ? parseInt(m[1], 10) : null;
-}
-function inSlotWindow(kickoffIso, slot) {
-  const h = hourFromIsoLocal(kickoffIso);
-  if (h == null) return false;
-  if (slot === "late") return h >= 0 && h < 10;
+function inSlotWindow(iso, slot) {
+  const h = hourInTZ(iso);
+  if (!Number.isFinite(h)) return true;
+  if (slot === "late") return h < 10;
   if (slot === "am")   return h >= 10 && h < 15;
   if (slot === "pm")   return h >= 15 && h <= 23;
   return true;
@@ -73,55 +45,133 @@ function uniqueIds(arr) {
   }
   return out;
 }
+function sanitizeYmd(x) {
+  const s = String(x || "").trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : new Intl.DateTimeFormat("en-CA", { timeZone: TZ }).format(new Date());
+}
+function sanitizeSlot(x) {
+  const s = String(x || "auto").toLowerCase();
+  if (s === "late" || s === "am" || s === "pm") return s;
+  // auto by Belgrade hour
+  const h = Number(new Intl.DateTimeFormat("en-GB", { timeZone: TZ, hour:"2-digit", hour12:false }).format(new Date()));
+  if (h < 10) return "late";
+  if (h < 15) return "am";
+  return "pm";
+}
 
-// Batch: pročitaj odds iz KV
+/* ---------------- robust KV readers ---------------- */
+function oddsKvFallbackEnv() {
+  // secondary backend used by refresh-odds writer in some deployments
+  const url = (process.env.UPSTASH_KV_REST_URL || "").replace(/\/+$/,"");
+  const token = process.env.UPSTASH_KV_REST_TOKEN || "";
+  return (url && token) ? { url, token } : null;
+}
+
+async function kvPipelineDual(cmds) {
+  // 1) primary via shared adapter
+  try {
+    const r = await s.kvPipeline(cmds);
+    if (Array.isArray(r)) {
+      // if at least one non-null, accept
+      if (r.some(x => (x?.result ?? x?.value ?? null) != null)) return r;
+    }
+  } catch {}
+  // 2) fallback: Upstash KV REST (if configured)
+  const fb = oddsKvFallbackEnv();
+  if (!fb) return null;
+  try {
+    const r = await fetch(`${fb.url}/pipeline`, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${fb.token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(cmds),
+      cache: "no-store"
+    });
+    if (!r.ok) return null;
+    const j = await r.json().catch(()=>null);
+    return Array.isArray(j) ? j : null;
+  } catch { return null; }
+}
+
+async function kvGetDual(key) {
+  try {
+    const v = await s.kvGet(key);
+    if (v !== undefined && v !== null) return v;
+  } catch {}
+  const fb = oddsKvFallbackEnv();
+  if (!fb) return null;
+  try {
+    const r = await fetch(`${fb.url}/get/${encodeURIComponent(key)}`, {
+      headers: { "Authorization": `Bearer ${fb.token}` },
+      cache: "no-store"
+    });
+    if (!r.ok) return null;
+    const j = await r.json().catch(()=>null);
+    return (j && (j.result ?? j.value)) ?? null;
+  } catch { return null; }
+}
+
+/* Batch: read odds from KV (tries both backends) */
 async function readOddsBulk(ids) {
   const out = new Map();
   if (!ids.length) return out;
   const cmds = ids.map(id => ["GET", `vb-odds:last:${id}`]);
   let resp = null;
-  try { resp = await s.kvPipeline(cmds); } catch { resp = null; }
+  try { resp = await kvPipelineDual(cmds); } catch { resp = null; }
   if (Array.isArray(resp)) {
-    ids.forEach((id, i) => out.set(id, resp[i]?.result ?? null));
+    ids.forEach((id, i) => {
+      const payload = resp[i]?.result ?? resp[i]?.value ?? null;
+      let parsed = null;
+      if (payload && typeof payload === "string") { try { parsed = JSON.parse(payload); } catch { parsed = null; } }
+      else if (payload && typeof payload === "object") { parsed = payload; }
+      out.set(id, parsed ?? null);
+    });
   }
   return out;
 }
 
-// Batch: pročitaj fixture meta (home/away/league/kickoff) iz KV
+/* Batch: read fixture meta (home/away/league/kickoff) from KV */
 async function readFixturesBulk(ids) {
   const out = new Map();
   if (!ids.length) return out;
   const cmds = ids.map(id => ["GET", `vb:fixture:${id}`]);
   let resp = null;
   try { resp = await s.kvPipeline(cmds); } catch { resp = null; }
+  if (!Array.isArray(resp)) {
+    // try fallback once
+    resp = await kvPipelineDual(cmds);
+  }
   if (Array.isArray(resp)) {
     ids.forEach((id, i) => {
-      const v = resp[i]?.result ?? null;
+      const v = resp[i]?.result ?? resp[i]?.value ?? null;
       if (v && typeof v === "object") out.set(id, v);
+      else if (typeof v === "string") { try {
+        const obj = JSON.parse(v);
+        if (obj && typeof obj === "object") out.set(id, obj);
+      } catch {} }
     });
   }
   return out;
 }
 
+/* ---------------- handler ---------------- */
 export default async function handler(req, res) {
   try {
     res.setHeader("Cache-Control", "no-store");
     const ymd  = sanitizeYmd(req.query.ymd);
     const slot = sanitizeSlot(req.query.slot);
 
-    // 1) Probaj locked games (pune stavke)
+    // 1) Try locked games (full items with confidence if available)
     let games = [];
     try {
       const g = await s.kvGet("vb-locked:kv:hit:games");
       if (Array.isArray(g)) games = g;
     } catch {}
 
-    // 2) Ako nema punih stavki, uzmi ID listu pa dopuni detalje iz vb:fixture:<id>
+    // 2) If no full items, use ID list then fill details from vb:fixture:<id>
     let ids = [];
     if (!games.length) {
       try { ids = uniqueIds(await s.kvGet("vb-locked:kv:hit") || []); } catch { ids = []; }
       if (!ids.length) {
-        // fallback lanac
         const chain = [`vbl_full:${ymd}:${slot}`, `vbl_full:${ymd}`, `vb:day:${ymd}:union`];
         for (const k of chain) {
           try {
@@ -146,13 +196,13 @@ export default async function handler(req, res) {
             awayTeam: v.away ?? v.awayTeam ?? null,
             leagueName: v.leagueName ?? v.league ?? null,
             start: v.kickoff ?? v.start ?? v.startTime ?? null,
-            startTime: v.kickoff ?? v.start ?? v.startTime ?? null
+            startTime: v.kickoff ?? v.start ?? v.startTime ?? null,
           };
         });
       }
     }
 
-    // 3) Filtriraj po slot prozoru + liga blokovi
+    // 3) Filter by slot window + league blocks
     games = games.filter(g => {
       const league = g.leagueName ?? g.league ?? null;
       if (league && isBlockedLeagueName(league)) return false;
@@ -162,11 +212,11 @@ export default async function handler(req, res) {
       return true;
     });
 
-    // 4) Odds iz KV (bez AF) + sort po kickoff
+    // 4) Odds from KV (no AF calls) + sort by kickoff
     const oddsMap = await readOddsBulk(games.map(g => g.id));
     games.sort((a,b)=> String(a.kickoff||"").localeCompare(String(b.kickoff||"")));
 
-    // 5) Finalnih do 15
+    // 5) Take first 15
     const picked = games.slice(0, 15).map(g => {
       const odds = oddsMap.get(g.id) ?? null;
       const obj = {
@@ -182,10 +232,24 @@ export default async function handler(req, res) {
         startTime: g.kickoff ?? g.start ?? g.startTime ?? undefined
       };
       if (odds) obj.odds = odds;
+      if (g.confidence_pct != null) obj.confidence_pct = g.confidence_pct;
+      else if (g.confidence != null) obj.confidence = g.confidence;
       return obj;
     });
 
-    // 6) Meta
+    // 6) Tickets (4×4): try primary KV then fallback KV
+    let tickets = await s.kvGet(`tickets:${ymd}:${slot}`).catch(()=>null);
+    if (!tickets) {
+      const raw = await kvGetDual(`tickets:${ymd}:${slot}`);
+      if (raw) {
+        try { tickets = (typeof raw === "string") ? JSON.parse(raw) : raw; } catch { tickets = null; }
+      }
+    }
+    if (!tickets || typeof tickets !== "object") {
+      tickets = { btts:[], ou25:[], htft:[], fh_ou15:[] };
+    }
+
+    // 7) Meta
     const metaRaw = await s.kvGet("vb-locked:kv:hit:meta").catch(()=>null);
     const nowIso = new Date().toISOString();
     const meta = {
@@ -200,6 +264,7 @@ export default async function handler(req, res) {
       items: picked,
       ids: picked.map(x => x.id),
       games: picked,
+      tickets,
       meta
     });
   } catch (e) {
