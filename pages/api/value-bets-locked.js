@@ -1,11 +1,12 @@
 // pages/api/value-bets-locked.js
-// Locked feed za UI, ultra-kompat:
-// - Vraća: items (minimalni objekti {id}), ids (brojevi), games (detalji za render), meta.
-// - Kad je ?slim=1, uradi auto-expand (max 15 AF poziva, cap-guarded). Bez slim — bez expand (KV-only).
-// - Fallback lista: vb-locked:kv:hit -> vbl_full:<ymd>:<slot>.
-// - Cache-Control: no-store (da UI ne dobije zastareo/prazan odgovor).
-//
-// Capovi: AM=2000, PM=3000, LATE=1000 (broji se samo AF expand; KV je besplatan).
+// Locked feed za UI, gde su "items" PRIORITETNO prošireni objekti (za slim=1).
+// - Kad ?slim=1: items = [{ id, home, away, league, kickoff }] (expand do max 15 AF poziva, cap-guarded).
+//   Ako neki id ne uspe da se proširi, vraća se fallback { id } na toj poziciji.
+// - Pored items, vraćamo i ids (brojevi) i games (isti kao items, radi kompatibilnosti).
+// - Kad slim!=1: legacy – items = niz ID-eva (bez expand).
+// - Fallback lista: vb-locked:kv:hit -> vbl_full:<ymd>:<slot> (KV-only; bez AF poziva za listu).
+// - Cache-Control: no-store da UI ne kešira prazan/zastareo odgovor.
+// - Capovi: AM=2000, PM=3000, LATE=1000 (broji se samo AF expand; KV je besplatan).
 
 const API_HOST = 'https://v3.football.api-sports.io';
 const SLOT_CAPS = { am:2000, pm:3000, late:1000 };
@@ -63,13 +64,12 @@ async function countedAF(url, opts, ymd, slot) {
   return resp;
 }
 
-/* ---------- expand iz API-FOOTBALL (max 15 id-eva) ---------- */
+/* ---------- expand iz API-FOOTBALL (max 15 id-eva, paralelno) ---------- */
 async function expandFixtures(ids, { ymd, slot }) {
   const keyRaw = process.env.API_FOOTBALL_KEY || process.env.NEXT_PUBLIC_API_FOOTBALL_KEY;
   const apiKey = (keyRaw||'').trim();
   if (!apiKey || !Array.isArray(ids) || ids.length===0) return [];
 
-  // Paralelno (15 req max) – i dalje daleko ispod cap-ova
   const tasks = ids.slice(0,15).map(async (id) => {
     try {
       const url = `${API_HOST}/fixtures?id=${id}&timezone=Europe/Belgrade`;
@@ -124,22 +124,31 @@ export default async function handler(req, res) {
       cap: 15,
     };
 
-    // 3) Pripremi sve oblike (da UI nađe šta god očekuje)
-    let games = [];
+    // 3) Odredi items/ids/games
+    let items, games;
+
     if (slim) {
-      try { games = await expandFixtures(ids, { ymd, slot }); }
-      catch { games = []; }
-      meta.returned = games.length || ids.length;
+      // PROŠIRI za slim=1 → items = prošireni objekti (prioritet za UI).
+      let rich = [];
+      try { rich = await expandFixtures(ids, { ymd, slot }); } catch { rich = []; }
+
+      // Napravi mapu pa sačuvaj redosled i popuni fallback gde nema podataka
+      const m = new Map(rich.map(x => [x.id, x]));
+      items = ids.map(id => m.get(id) || { id });   // fallback {id} na toj poziciji
+      games = items;                                 // zbog kompatibilnosti, games = items
+
+      // meta.returned = koliko stvarno ima renderabilnih (ili ukupno ako nema podataka)
+      meta.returned = items.length;
+    } else {
+      // Legacy: bez slim → items = niz ID-eva, bez expand
+      items = ids;
+      games = []; // nema expand u ovom režimu
     }
 
-    // items = minimalni objekti (retro-kompat)
-    const items = ids.map(id => ({ id }));
-
-    // ids = čisti brojevi (ako UI mapira brojevima)
     return res.status(200).json({
-      items,     // [{ id }]
+      items,     // slim=1 -> [{ id, home, away, league, kickoff }] (sa fallback {id}); legacy -> [number]
       ids,       // [ number ]
-      games,     // [{ id, home, away, league, kickoff }]
+      games,     // == items u slim=1; [] inače
       meta
     });
   } catch (e) {
