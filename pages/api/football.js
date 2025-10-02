@@ -2,9 +2,7 @@
 // slim=1 -> vraća proširene kartice (home/away/league/kickoff) do 15 kom, cap-guarded
 // legacy (bez slim=1) -> vraća IDs iz vbl_full (kao ranije)
 
-import { arrFromAny, toJson, kvGet, kvSet } from "../../lib/kv-read";
-import learningRuntime from "../../lib/learning/runtime";
-const { resolveLeagueTier } = learningRuntime;
+import { kvGet, kvSet } from "../../lib/kv-read";
 
 export const config = { api: { bodyParser: false } };
 
@@ -25,6 +23,18 @@ function detectSlot(tz = TZ) {
 }
 function spentKey(ymd, slot) { return `afc:spent:${ymd}:${slot}`; }
 function capFor(slot) { return SLOT_CAPS[slot] ?? 2000; }
+
+// Treat placeholders like "<YMD>", "%3CYMD%3E" etc. as missing.
+function sanitizeYmd(v) {
+  const s = decodeURIComponent(String(v || "")).trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  return s;
+}
+function sanitizeSlot(v) {
+  const s = decodeURIComponent(String(v || "")).trim().toLowerCase();
+  if (!/^(am|pm|late)$/.test(s)) return null;
+  return s;
+}
 
 async function countedAF(url, opts, ymd, slot) {
   const u = typeof url === "string" ? url : String(url?.url || url);
@@ -64,11 +74,13 @@ async function expandList(ids, { ymd, slot }) {
 export default async function handler(req, res) {
   try {
     res.setHeader("Cache-Control", "no-store");
-    const ymd = (req.query.ymd || "").match(/^\d{4}-\d{2}-\d{2}$/) ? req.query.ymd : ymdFromTZ(TZ);
-    const slot = (req.query.slot || "").match(/^(am|pm|late)$/) ? req.query.slot : detectSlot(TZ);
+
+    const ymd = sanitizeYmd(req.query.ymd) || ymdFromTZ(TZ);
+    const slot = sanitizeSlot(req.query.slot) || detectSlot(TZ);
     const slim = String(req.query.slim || "0") === "1";
 
     if (slim) {
+      // locked -> fallback vbl_full
       let locked = await kvGet("vb-locked:kv:hit");
       if (!Array.isArray(locked) || locked.length === 0) {
         const vbl = await kvGet(`vbl_full:${ymd}:${slot}`);
@@ -82,12 +94,13 @@ export default async function handler(req, res) {
       return res.status(200).json({
         ok: true, ymd, slot,
         count: games.length,
-        items: games,
+        items: games,   // za UI
         ids,
         key: `vbl_full:${ymd}:${slot}`
       });
     }
 
+    // legacy: samo IDs iz vbl_full
     const vbl = await kvGet(`vbl_full:${ymd}:${slot}`) || [];
     const ids = Array.isArray(vbl) ? vbl : [];
     return res.status(200).json({
@@ -97,6 +110,7 @@ export default async function handler(req, res) {
       items: ids
     });
   } catch (e) {
+    // vrati dijagnostiku kao 200 da UI ne padne na 500
     return res.status(200).json({ ok:false, error: String(e?.message || e) });
   }
 }
