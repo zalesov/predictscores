@@ -1,105 +1,94 @@
 // pages/api/cron/apply-learning.js
-// Reads union and writes vbl_full:* in the unified KV
+// Formira vbl_full:<YMD>:<slot> i vbl_full:<YMD> iz union-a,
+// bez lomljenja: ne menja shape, samo doda lake filtre gde ima meta.
+// Blacklist po ID-u liga će biti strogo primenjena u refresh-odds/value-bets-locked.
 
-function resolveKV() {
-  const url = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
-  if (!url || !token) throw new Error('KV env missing');
-  return { url, token };
-}
-async function kvGet(key) {
-  const { url, token } = resolveKV();
-  try {
-    const r = await fetch(`${url}/get/${encodeURIComponent(key)}?token=${token}`);
-    if (r.ok) {
-      const j = await r.json();
-      let v = j?.result ?? null;
-      if (typeof v === 'string') { try { v = JSON.parse(v); } catch(_){} }
-      return v;
-    }
-  } catch(_) {}
-  try {
-    const r2 = await fetch(`${url}/pipeline`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'authorization': `Bearer ${token}` },
-      body: JSON.stringify([['GET', key]]),
-    });
-    if (r2.ok) {
-      const arr = await r2.json();
-      let v = arr?.[0]?.result ?? null;
-      if (typeof v === 'string') { try { v = JSON.parse(v); } catch(_){} }
-      return v;
-    }
-  } catch(_) {}
-  return null;
-}
-async function kvSetVerified(key, value) {
-  const { url, token } = resolveKV();
-  const val = typeof value === 'string' ? value : JSON.stringify(value);
-  let ok=false;
-  try {
-    const r = await fetch(`${url}/set`, {
-      method:'POST', headers:{'content-type':'application/json','authorization':`Bearer ${token}`},
-      body: JSON.stringify({ key, value: val }),
-    });
-    ok = r.ok;
-  } catch(_){}
-  if (!ok) {
-    try {
-      const r2 = await fetch(`${url}/set/${encodeURIComponent(key)}/${encodeURIComponent(val)}?token=${token}`, { method:'POST' });
-      ok = r2.ok;
-    } catch(_){}
-  }
-  if (!ok) {
-    try {
-      const r3 = await fetch(`${url}/pipeline`, {
-        method:'POST', headers:{'content-type':'application/json','authorization':`Bearer ${token}`},
-        body: JSON.stringify([['SET', key, val]]),
-      });
-      ok = r3.ok;
-    } catch(_){}
-  }
-  if (!ok) throw new Error(`KV_SET_FAILED:${key}`);
-  const got = await kvGet(key);
-  const exp = typeof value==='string'? value : JSON.parse(val);
-  if (JSON.stringify(got)!==JSON.stringify(exp)) throw new Error(`KV_VERIFY_FAILED:${key}`);
-  return true;
-}
+import * as s from "../../../lib/kv-read";
 
-function ymdFromTZ(tz='Europe/Belgrade'){
-  const d=new Date(new Date().toLocaleString('en-US',{timeZone:tz}));
-  const y=d.getFullYear(), m=String(d.getMonth()+1).padStart(2,'0'), dd=String(d.getDate()).padStart(2,'0');
+export const config = { api: { bodyParser: false } };
+
+const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
+const SLOT_CAPS = { late: 1000, am: 2000, pm: 3000 };
+
+// Opcioni: hard blacklist liga po ID-u (popuni po želji)
+const BLOCKED_LEAGUE_IDS = [
+  // npr: 128, 71, ...
+];
+
+function ymdNow() {
+  const d = new Date(new Date().toLocaleString("en-US", { timeZone: TZ }));
+  const y = d.getFullYear(), m = String(d.getMonth() + 1).padStart(2, "0"), dd = String(d.getDate()).padStart(2, "0");
   return `${y}-${m}-${dd}`;
 }
-function slotByHour(h){ if(h<12)return'am'; if(h<17)return'pm'; return'late'; }
-function detectSlot(tz='Europe/Belgrade'){ const h=Number(new Date(new Date().toLocaleString('en-US',{timeZone:tz})).getHours()); return slotByHour(h); }
 
-export default async function handler(req,res){
-  try{
-    const tz='Europe/Belgrade';
-    const ymd=(req.query.ymd||'').match(/^\d{4}-\d{2}-\d{2}$/)?req.query.ymd:ymdFromTZ(tz);
-    const slot=(req.query.slot||'').match(/^(am|pm|late)$/)?req.query.slot:detectSlot(tz);
+function sanitizeYmd(v){
+  const sVal = decodeURIComponent(String(v || "")).trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(sVal) ? sVal : ymdNow();
+}
+function sanitizeSlot(v){
+  const sVal = decodeURIComponent(String(v || "")).trim().toLowerCase();
+  return /^(am|pm|late)$/.test(sVal) ? sVal : detectSlot();
+}
+function detectSlot(){
+  const h = Number(new Date(new Date().toLocaleString("en-US", { timeZone: TZ })).getHours());
+  if (h < 10) return "late";
+  if (h < 15) return "am";
+  return "pm";
+}
 
-    const sourceKey=`vb:day:${ymd}:union`;
-    const union=(await kvGet(sourceKey))||[];
-    const items=Array.isArray(union)?union:[];
-    const vblSlotKey=`vbl_full:${ymd}:${slot}`;
-    const vblDayKey=`vbl_full:${ymd}`;
-    const historyKey=`vb:history:${ymd}`;
-    const lockKey=`vb:day:${ymd}:last`;
-    const vbHit='vb-locked:kv:hit';
-    const vbHitDay=`${vbHit}:${ymd}`;
+function uniqueIds(arr) {
+  const seen = new Set(), out = [];
+  for (const v of Array.isArray(arr) ? arr : []) {
+    const id = typeof v === "number" ? v : v?.id;
+    if (typeof id === "number" && !seen.has(id)) { seen.add(id); out.push(id); }
+  }
+  return out;
+}
 
-    // Your existing scoring/learning can sit here; we just forward the union for now:
-    await kvSetVerified(vblSlotKey, items);
-    await kvSetVerified(vblDayKey, items);
-    await kvSetVerified(lockKey, items);
-    await kvSetVerified(historyKey, { ymd, slot, count: items.length, ts: new Date().toISOString() });
-    await kvSetVerified(vbHit, true);
-    await kvSetVerified(vbHitDay, true);
+export default async function handler(req, res) {
+  try {
+    res.setHeader("Cache-Control", "no-store");
+    const ymd = sanitizeYmd(req.query.ymd);
+    const slot = sanitizeSlot(req.query.slot);
 
-    return res.status(200).json({ ok:true, ymd, slot, count: items.length, wrote: { vblSlotKey, vblDayKey, historyKey, lockKey, vbHitDay, vbHit }, sourceKey });
-  }catch(e){
-    return res.status(200).json({ ok:false, error:String(e?.message||e) });
+    // 1) Učitaj union za dan
+    const union = await s.kvGet(`vb:day:${ymd}:union`) || [];
+    let ids = uniqueIds(union);
+
+    // 2) (Opc.) Ako postoje već keširani detalji u KV po ID-u sa leagueId, isključi blokirane lige
+    // Ovo je "best effort" – ne troši AF cap. Glavni, strogi filter je u refresh-odds.
+    const detailed = await s.kvMGet(ids.map(id => `vb:fixture:${id}`).filter(Boolean)).catch(() => null);
+    if (Array.isArray(detailed) && detailed.length) {
+      const map = new Map();
+      for (let i = 0; i < detailed.length; i++) {
+        const row = detailed[i];
+        if (row && typeof row === "object" && typeof row.id === "number") {
+          map.set(row.id, row);
+        }
+      }
+      ids = ids.filter(id => {
+        const r = map.get(id);
+        const leagueId = r?.league?.id ?? r?.leagueId;
+        if (typeof leagueId === "number" && BLOCKED_LEAGUE_IDS.includes(leagueId)) return false;
+        return true;
+      });
+    }
+
+    // 3) Zapiši slot listu i dnevnu listu (learning heuristike možeš proširiti kasnije)
+    await s.kvSet(`vbl_full:${ymd}:${slot}`, ids);
+    await s.kvSet(`vbl_full:${ymd}`, ids);
+
+    await s.kvSet(`vb:history:${ymd}`, { ymd, slot, count: ids.length, ts: new Date().toISOString() });
+
+    return res.status(200).json({
+      ok: true, ymd, slot, count: ids.length,
+      wrote: {
+        vblSlotKey: `vbl_full:${ymd}:${slot}`,
+        vblDayKey: `vbl_full:${ymd}`,
+        historyKey: `vb:history:${ymd}`
+      }
+    });
+  } catch (e) {
+    return res.status(200).json({ ok:false, error: String(e?.message || e) });
   }
 }
