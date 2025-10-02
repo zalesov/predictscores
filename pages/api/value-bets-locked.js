@@ -1,8 +1,11 @@
 // pages/api/value-bets-locked.js
-// Locked feed za UI.
-// Promena: kad je ?slim=1, sada AUTOMATSKI vraća objekte { id, home, away, league, kickoff }.
-// Ako AF poziv ne uspe ili cap udari, vrati fallback { id } (da UI barem nešto renderuje).
-// Fallback izvora liste: vb-locked:kv:hit -> vbl_full:<ymd>:<slot>. KV-only za listu; AF samo za expand (max 15).
+// Locked feed za UI, ultra-kompat:
+// - Vraća: items (minimalni objekti {id}), ids (brojevi), games (detalji za render), meta.
+// - Kad je ?slim=1, uradi auto-expand (max 15 AF poziva, cap-guarded). Bez slim — bez expand (KV-only).
+// - Fallback lista: vb-locked:kv:hit -> vbl_full:<ymd>:<slot>.
+// - Cache-Control: no-store (da UI ne dobije zastareo/prazan odgovor).
+//
+// Capovi: AM=2000, PM=3000, LATE=1000 (broji se samo AF expand; KV je besplatan).
 
 const API_HOST = 'https://v3.football.api-sports.io';
 const SLOT_CAPS = { am:2000, pm:3000, late:1000 };
@@ -66,39 +69,40 @@ async function expandFixtures(ids, { ymd, slot }) {
   const apiKey = (keyRaw||'').trim();
   if (!apiKey || !Array.isArray(ids) || ids.length===0) return [];
 
-  const out = [];
-  for (const id of ids) {
+  // Paralelno (15 req max) – i dalje daleko ispod cap-ova
+  const tasks = ids.slice(0,15).map(async (id) => {
     try {
       const url = `${API_HOST}/fixtures?id=${id}&timezone=Europe/Belgrade`;
       const r = await countedAF(url, { headers:{ 'x-apisports-key': apiKey, 'accept':'application/json' } }, ymd, slot);
       const data = await r.json();
-
-      // detektuj "errors" i preskoči taj id
-      if (data?.errors && Object.keys(data.errors).length>0) continue;
+      if (data?.errors && Object.keys(data.errors).length>0) return null;
 
       const row = Array.isArray(data?.response) ? data.response[0] : null;
+      if (!row) return null;
+
       const home = row?.teams?.home?.name || null;
       const away = row?.teams?.away?.name || null;
       const league = row?.league?.name || null;
       const kickoff = row?.fixture?.date || null;
 
-      out.push({ id, home, away, league, kickoff });
-      if (out.length >= 15) break;
+      return { id, home, away, league, kickoff };
     } catch {
-      // na bilo koju grešku, preskoči ovaj id
-      continue;
+      return null;
     }
-  }
-  return out;
+  });
+
+  const results = await Promise.all(tasks);
+  return results.filter(Boolean);
 }
 
 export default async function handler(req, res) {
   try {
+    res.setHeader('Cache-Control', 'no-store');
+
     const tz = 'Europe/Belgrade';
     const ymd = (req.query.ymd||'').match(/^\d{4}-\d{2}-\d{2}$/) ? req.query.ymd : ymdFromTZ(tz);
     const slot = (req.query.slot||'').match(/^(am|pm|late)$/) ? req.query.slot : detectSlot(tz);
     const slim = String(req.query.slim||'0') === '1';
-    const expand = String(req.query.expand||'0') === '1';
 
     // 1) Locked lista ili fallback na vbl_full
     let locked = (await kvGet('vb-locked:kv:hit')) || [];
@@ -120,36 +124,24 @@ export default async function handler(req, res) {
       cap: 15,
     };
 
-    // 3) Items
-    let items;
-
+    // 3) Pripremi sve oblike (da UI nađe šta god očekuje)
+    let games = [];
     if (slim) {
-      // AUTO-EXPAND ZA SLIM: pokušaj da dovučeš minimalna polja;
-      // ako ne uspe (cap/errors), vrati fallback { id }.
-      let rich = [];
-      let expandFailed = false;
-      try { rich = await expandFixtures(ids, { ymd, slot }); }
-      catch { expandFailed = true; }
-
-      if (!expandFailed && Array.isArray(rich) && rich.length > 0) {
-        items = rich.map(x => ({ id: x.id, home: x.home, away: x.away, league: x.league, kickoff: x.kickoff }));
-        meta.returned = items.length;
-      } else {
-        items = ids.map(id => ({ id })); // fallback — barem neće biti prazna kartica
-        meta.returned = items.length;
-      }
-    } else {
-      // Legacy ponašanje kad slim nije 1
-      if (expand) {
-        const rich = await expandFixtures(ids, { ymd, slot });
-        items = rich;
-        meta.returned = Array.isArray(rich) ? rich.length : 0;
-      } else {
-        items = ids; // niz ID-eva
-      }
+      try { games = await expandFixtures(ids, { ymd, slot }); }
+      catch { games = []; }
+      meta.returned = games.length || ids.length;
     }
 
-    return res.status(200).json({ items, meta });
+    // items = minimalni objekti (retro-kompat)
+    const items = ids.map(id => ({ id }));
+
+    // ids = čisti brojevi (ako UI mapira brojevima)
+    return res.status(200).json({
+      items,     // [{ id }]
+      ids,       // [ number ]
+      games,     // [{ id, home, away, league, kickoff }]
+      meta
+    });
   } catch (e) {
     return res.status(200).json({ ok:false, error:String(e?.message||e) });
   }
