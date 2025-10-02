@@ -37,19 +37,19 @@ jobs:
 
       - name: Rebuild snapshot (+union)
         env:
-          BASE: ${{ secrets.PS_BASE_URL }}
+          BASE: ${{ secrets.BASE_URL }}
         run: |
           curl -fsS "$BASE/api/cron/rebuild?ymd=${{ steps.when.outputs.ymd }}&slot=${{ steps.when.outputs.slot }}&debug=1"
 
       - name: Apply learning (write vbl_full)
         env:
-          BASE: ${{ secrets.PS_BASE_URL }}
+          BASE: ${{ secrets.BASE_URL }}
         run: |
           curl -fsS "$BASE/api/cron/apply-learning?ymd=${{ steps.when.outputs.ymd }}&slot=${{ steps.when.outputs.slot }}&debug=1"
 
       - name: Refresh odds (guarded + lock/meta)
         env:
-          BASE: ${{ secrets.PS_BASE_URL }}
+          BASE: ${{ secrets.BASE_URL }}
         run: |
           curl -fsS "$BASE/api/cron/refresh-odds?ymd=${{ steps.when.outputs.ymd }}&slot=${{ steps.when.outputs.slot }}&debug=1"
 
