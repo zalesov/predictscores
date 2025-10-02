@@ -1,5 +1,6 @@
 // pages/api/value-bets-locked.js
-// Vraća zaključanu listu i meta; ne troši AF pozive.
+// Vraća zaključanu listu (vb-locked:kv:hit) i meta; fallback na vbl_full:<ymd>:<slot>
+// kad zaključana lista još nije postavljena. KV-only; bez AF poziva.
 
 function resolveKV() {
   const url = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
@@ -25,7 +26,6 @@ async function kvGet(key) {
     return v;
   } catch { return null; }
 }
-
 function ymdFromTZ(tz='Europe/Belgrade'){
   const d = new Date(new Date().toLocaleString('en-US',{ timeZone: tz }));
   const y=d.getFullYear(), m=String(d.getMonth()+1).padStart(2,'0'), dd=String(d.getDate()).padStart(2,'0');
@@ -41,13 +41,17 @@ export default async function handler(req,res){
     const slot=(req.query.slot||'').match(/^(am|pm|late)$/)?req.query.slot:detectSlot(tz);
     const slim = String(req.query.slim||'0') === '1';
 
-    // Locked lista + meta
-    const listKey = 'vb-locked:kv:hit';
-    const metaKey = 'vb-locked:kv:hit:meta';
-    const items = (await kvGet(listKey)) || [];
-    const metaRaw = (await kvGet(metaKey)) || null;
+    // 1) Pokušaj zaključanu listu
+    let items = (await kvGet('vb-locked:kv:hit')) || [];
 
-    // Synthetizuj meta kad nedostaje (da UI ne ostane prazan)
+    // 2) Fallback na vbl_full:<ymd>:<slot> (i iseći na cap=15)
+    if (!Array.isArray(items) || items.length === 0) {
+      const vbl = (await kvGet(`vbl_full:${ymd}:${slot}`)) || [];
+      items = Array.isArray(vbl) ? vbl.slice(0, 15) : [];
+    }
+
+    // 3) Meta – koristi realnu meta vrednost ako postoji, inače synth now
+    const metaRaw = (await kvGet('vb-locked:kv:hit:meta')) || null;
     const nowIso = new Date().toISOString();
     const meta = {
       ymd,
