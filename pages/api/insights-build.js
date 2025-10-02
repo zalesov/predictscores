@@ -1,299 +1,99 @@
 // pages/api/insights-build.js
-import { arrFromAny, toJson } from "../../lib/kv-read";
+// PURPOSE: Build and store tickets:<ymd>:<slot> based on existing KV sources.
+// Safe-guards: coalesce any undefined arrays to [] so we never throw on ".length".
+// No external API calls; budgets unchanged.
+
+import * as s from "../../lib/kv-read";
 
 export const config = { api: { bodyParser: false } };
 
-/* ---------- TZ (samo TZ_DISPLAY) ---------- */
-function pickTZ() {
-  const raw = (process.env.TZ_DISPLAY || "Europe/Belgrade").trim();
-  try { new Intl.DateTimeFormat("en-GB", { timeZone: raw }); return raw; } catch { return "Europe/Belgrade"; }
-}
-const TZ = pickTZ();
+const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 
-/* ---------- KV (Vercel KV / Upstash) ---------- */
-function kvBackends() {
-  const out = [];
-  const aU = process.env.KV_REST_API_URL, aT = process.env.KV_REST_API_TOKEN;
-  const bU = process.env.UPSTASH_REDIS_REST_URL, bT = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (aU && aT) out.push({ flavor:"vercel-kv", url:aU.replace(/\/+$/,""), tok:aT });
-  if (bU && bT) out.push({ flavor:"upstash-redis", url:bU.replace(/\/+$/,""), tok:bT });
+function todayYmd() {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: TZ }).format(new Date());
+}
+function sanitizeYmd(x) {
+  const s0 = String(x || "").trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(s0) ? s0 : todayYmd();
+}
+function sanitizeSlot(x) {
+  const s = String(x || "auto").toLowerCase();
+  if (s === "late" || s === "am" || s === "pm") return s;
+  const h = Number(new Intl.DateTimeFormat("en-GB", { timeZone: TZ, hour: "2-digit", hour12: false }).format(new Date()));
+  if (h < 10) return "late";
+  if (h < 15) return "am";
+  return "pm";
+}
+
+function toArray(x) { return Array.isArray(x) ? x : []; }
+
+function byConfidenceDesc(a, b) {
+  const ca = (typeof a?.confidence_pct === "number" ? a.confidence_pct
+           : (typeof a?.confidence === "number" ? a.confidence
+           : (typeof a?.score === "number" ? a.score : 0)));
+  const cb = (typeof b?.confidence_pct === "number" ? b.confidence_pct
+           : (typeof b?.confidence === "number" ? b.confidence
+           : (typeof b?.score === "number" ? b.score : 0)));
+  return cb - ca;
+}
+
+function mkTicketBuckets(fromCombined) {
+  const out = { btts: [], ou25: [], fh_ou15: [], htft: [] };
+  for (const it of toArray(fromCombined)) {
+    const mk = String(it?.market_key ?? it?.market ?? it?.type ?? "").toLowerCase();
+    const base = {
+      id: it?.fixture_id ?? it?.id,
+      confidence_pct:
+        (typeof it?.confidence_pct === "number" ? it.confidence_pct
+          : (typeof it?.confidence === "number" ? it.confidence
+          : (typeof it?.score === "number" ? it.score : 0))),
+      kickoff: it?.kickoff ?? it?.start ?? it?.startTime,
+      leagueId: it?.leagueId ?? it?.league?.id,
+      league: it?.leagueName ?? it?.league,
+      home: it?.home ?? it?.homeTeam,
+      away: it?.away ?? it?.awayTeam
+    };
+    if (typeof base.id !== "number") continue;
+
+    if (mk.includes("btts")) out.btts.push(base);
+    else if (mk.includes("ou25") || mk.includes("over_2_5") || mk.includes("over25") || mk.includes("over 2.5")) out.ou25.push(base);
+    else if (mk.includes("fh_ou15") || mk.includes("over15_ht") || mk.includes("over 1.5 ht") || mk.includes("ht over 1.5")) out.fh_ou15.push(base);
+    else if (mk.includes("htft")) out.htft.push(base);
+  }
+  // rank & cap to 4 each
+  for (const k of Object.keys(out)) {
+    out[k].sort(byConfidenceDesc);
+    out[k] = out[k].slice(0, 4);
+  }
   return out;
-}
-async function kvGETraw(key, trace) {
-  for (const b of kvBackends()) {
-    try {
-      const r = await fetch(`${b.url}/get/${encodeURIComponent(key)}`,{ headers:{ Authorization:`Bearer ${b.tok}` }, cache:"no-store" });
-      const j = await r.json().catch(()=>null);
-      const payload = j?.result ?? j?.value;
-      let raw = null;
-      if (typeof payload === "string") {
-        raw = payload;
-      } else if (payload !== undefined) {
-        try { raw = JSON.stringify(payload ?? null); } catch { raw = null; }
-      }
-      trace && trace.push({ get:key, ok:r.ok, flavor:b.flavor, hit: typeof raw === "string" });
-      if (!r.ok) continue;
-      return { raw, flavor:b.flavor };
-    } catch (e) { trace && trace.push({ get:key, ok:false, err:String(e?.message||e) }); }
-  }
-  return { raw:null, flavor:null };
-}
-async function kvSET(key, value, trace) {
-  const saved = [];
-  const body = (typeof value === "string") ? value : JSON.stringify(value);
-  for (const b of kvBackends()) {
-    try {
-      const r = await fetch(`${b.url}/set/${encodeURIComponent(key)}`,{
-        method:"POST", headers:{ Authorization:`Bearer ${b.tok}`, "Content-Type":"application/json" }, cache:"no-store", body
-      });
-      saved.push({ flavor:b.flavor, ok:r.ok });
-    } catch (e) { saved.push({ flavor:b.flavor, ok:false, err:String(e?.message||e) }); }
-  }
-  trace && trace.push({ set:key, saved }); return saved;
-}
-
-/* ---------- utils ---------- */
-const ymdInTZ = (d, tz) => new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(d);
-const hourInTZ = (d, tz) => Number(new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour12:false, hour:"2-digit" }).format(d));
-function canonicalSlot(x){ x=String(x||"auto").toLowerCase(); return x==="late"||x==="am"||x==="pm"?x:"auto"; }
-function autoSlot(d,tz){ const h=hourInTZ(d,tz); return h<10?"late":(h<15?"am":"pm"); }
-// Uvek "danas" (workflow prosleđuje ymd kad je drugi dan potreban)
-function targetYmdForSlot(now, slot, tz){ return ymdInTZ(now, tz); }
-const isValidYmd = (s)=> /^\d{4}-\d{2}-\d{2}$/.test(String(s||""));
-
-/* ---------- selection helpers ---------- */
-const num = v => Number.isFinite(v) ? v : Number(v);
-const MIN_ODDS = (()=>{ const v=Number(process.env.MIN_ODDS); return Number.isFinite(v)&&v>1 ? v : 1.5; })();
-const pickPrice = (v)=>{ const n=num(v); return Number.isFinite(n) ? n : null; };
-const kickoffISO = (it)=> it?.fixture?.date || it?.fixture_date || it?.kickoff || it?.kickoff_utc || it?.ts || null;
-const confPct = (it)=> Number.isFinite(it?.confidence_pct) ? it.confidence_pct : (Number(it?.confidence)||0);
-const byStrength = (a,b)=> (confPct(b)-confPct(a)) || (new Date(kickoffISO(a)).getTime() - new Date(kickoffISO(b)).getTime());
-
-/* ---------- tickets snapshot record ---------- */
-function snapshotItem(it, market_key, price, books_count, pick, extra={}){
-  const fx = it?.fixture?.id || it?.fixture_id || it?.id || null;
-  return {
-    fixture_id: fx,
-    league: it?.league || it?.fixture?.league || null,
-    teams: it?.teams || it?.fixture?.teams || null,
-    kickoff: kickoffISO(it),
-    market_key, pick,
-    price_snapshot: price ?? null,
-    books_count_snapshot: Number(books_count)||0,
-    frozen: true,
-    snapshot_at: new Date().toISOString(),
-    ...extra
-  };
-}
-
-/* ---------- derive helpers for Top-3 ---------- */
-function marketPickFromItem(it) {
-  // Prefer canonical fields if postoje
-  const mk = (it?.market_key || it?.market || "").toString().toLowerCase();
-  const pickTxt = (it?.pick || it?.selection_label || "").toString().toLowerCase();
-  const m = it?.markets || {};
-  // Mapiraj na interni ključ + izvuci cenu iz markets.* ako postoji
-  if (/^h2h|1x2|match\s*winn?er/.test(mk)) {
-    // pokušaj prepoznati smer iz it.pick (home/draw/away)
-    let side = null;
-    if (/home|1\b/.test(pickTxt)) side = "home";
-    else if (/draw|x\b|tie/.test(pickTxt)) side = "draw";
-    else if (/away|2\b/.test(pickTxt)) side = "away";
-    const price = side ? m?.h2h?.[side] : null;
-    return { market_key:"h2h", pick: side || "home", price: price ?? null, books: m?.h2h?.books_count };
-  }
-  if (/btts|both\s*teams\s*to\s*score/.test(mk)) {
-    const price = m?.btts?.yes ?? null;
-    return { market_key:"btts", pick:"yes", price, books: m?.btts?.books_count };
-  }
-  if (/ou|over\/under|goals/.test(mk) || /2\.5/.test(pickTxt)) {
-    const price = m?.ou25?.over ?? null;
-    return { market_key:"ou25", pick:"over", price, books: m?.ou25?.books_count };
-  }
-  if (/ht\s*\/\s*ft|htft|half\s*time.*full\s*time/.test(mk)) {
-    const hh = m?.htft?.hh, aa = m?.htft?.aa;
-    const chose = Number.isFinite(hh) && Number.isFinite(aa) ? (hh>=aa?{p:hh,code:"hh"}:{p:aa,code:"aa"})
-                 : Number.isFinite(hh) ? {p:hh,code:"hh"} : Number.isFinite(aa) ? {p:aa,code:"aa"} : null;
-    return chose ? { market_key:"htft", pick:chose.code, price:chose.p, books:m?.htft?.books_count } : null;
-  }
-  if (/fh|first.*half/.test(mk)) {
-    const price = m?.fh_ou15?.over ?? null;
-    return { market_key:"fh_ou15", pick:"over", price, books:m?.fh_ou15?.books_count };
-  }
-  return null;
-}
-
-/* ---------- merge Top-3 + tickets u vb:day:<ymd>:combined ---------- */
-function dedupKey(e){
-  const f = e?.fixture_id || e?.fixture?.id || e?.id;
-  return `${f || "?"}__${String(e?.market_key||"").toLowerCase()}__${String(e?.pick||"").toLowerCase()}`;
-}
-async function mergeCombined({ ymd, slot, top3Items, ticketsSnap, trace, wantDebug = false }) {
-  const key = `vb:day:${ymd}:combined`;
-  const { raw: prevRaw } = await kvGETraw(key, trace);
-  const prevValue = toJson(prevRaw);
-  const prevArr = arrFromAny(prevValue);
-  const prev = prevArr.array || [];
-  const traceEntry = { combined_key: key };
-  if (wantDebug) {
-    const prevJsonMeta = { ...prevValue.meta };
-    const prevArrayMeta = { ...prevArr.meta };
-    traceEntry.read_meta = { json: prevJsonMeta, array: prevArrayMeta };
-  }
-  const by = new Map(prev.map(e => [dedupKey(e), e]));
-  let added = 0;
-
-  // 1) Top-3: pretvori u snapshot zapise
-  for (const it of (top3Items||[])) {
-    const mp = marketPickFromItem(it);
-    if (!mp) continue;
-    const entry = snapshotItem(it, mp.market_key, mp.price, mp.books, mp.pick, {
-      source: "top3",
-      slot
-    });
-    entry.visible_for_history = (entry.market_key === "h2h"); // History vidi samo h2h
-    const keyD = dedupKey(entry);
-    if (!by.has(keyD)) { by.set(keyD, entry); added++; }
-  }
-
-  // 2) Tiketi 4×4: već su snap-ovani; samo dodaj meta i dedup
-  function enrichAndAdd(list, market_key) {
-    for (const row of (list||[])) {
-      const e = { ...row, source:"ticket", slot, market_key: market_key || row.market_key };
-      e.visible_for_history = (e.market_key === "h2h");
-      const keyD = dedupKey(e);
-      if (!by.has(keyD)) { by.set(keyD, e); added++; }
-    }
-  }
-  enrichAndAdd(ticketsSnap?.btts,   "btts");
-  enrichAndAdd(ticketsSnap?.ou25,   "ou25");
-  enrichAndAdd(ticketsSnap?.htft,   "htft");
-  enrichAndAdd(ticketsSnap?.fh_ou15,"fh_ou15");
-
-  if (added > 0) {
-    const merged = Array.from(by.values());
-    await kvSET(key, merged, trace);
-    traceEntry.added = added;
-    traceEntry.total = merged.length;
-  } else {
-    traceEntry.added = 0;
-    traceEntry.note = "no-op";
-  }
-  trace && trace.push(traceEntry);
 }
 
 export default async function handler(req, res) {
   try {
-    const trace = [];
-    const now = new Date();
-    const wantDebug = String(req.query?.debug || "") === "1";
-    const readMeta = wantDebug ? [] : null;
+    res.setHeader("Cache-Control", "no-store");
+    const ymd  = sanitizeYmd(req.query.ymd);
+    const slot = sanitizeSlot(req.query.slot);
+    const debug = String(req.query.debug || "") === "1";
 
-    const qSlot = canonicalSlot(req.query.slot);
-    const slot  = qSlot==="auto" ? autoSlot(now, TZ) : qSlot;
+    // Sources (KV only). Any of these can be missing; coalesce to [].
+    const lockedGames = toArray(await s.kvGet("vb-locked:kv:hit:games"));
+    const combined    = toArray(await s.kvGet(`vb:day:${ymd}:combined`));
+    const vblSlot     = toArray(await s.kvGet(`vbl_full:${ymd}:${slot}`));
 
-    const qYmd = String(req.query.ymd||"").trim();
-    const ymd  = isValidYmd(qYmd) ? qYmd : targetYmdForSlot(now, slot, TZ);
+    // Prefer combined to build tickets (carries market info).
+    const tickets = mkTicketBuckets(combined);
 
-    /* kandidati: prefer vbl_full → vbl → vb:day:<slot> → vb:day:union */
-    const tried = [
-      `vbl_full:${ymd}:${slot}`,
-      `vbl:${ymd}:${slot}`,
-      `vb:day:${ymd}:${slot}`,
-      `vb:day:${ymd}:union`
-    ];
-    let baseArr=null, source=null;
-    for (const k of tried) {
-      const { raw } = await kvGETraw(k, trace);
-      const jsonValue = toJson(raw);
-      const arr = arrFromAny(jsonValue);
-      if (wantDebug) {
-        const metaJson = { ...jsonValue.meta };
-        const metaArray = { ...arr.meta };
-        readMeta.push({ key: k, json: metaJson, array: metaArray });
-      }
-      if (arr.array.length){ baseArr=arr.array; source=k; break; }
-    }
+    // Write snapshot
+    await s.kvSet(`tickets:${ymd}:${slot}`, tickets);
 
-    if (!baseArr) {
-      return res.status(200).json({ ok:true, ymd, slot, source:null, counts:{btts:0,ou25:0,htft:0,fh_ou15:0}, note:"no-source-items", debug:{ trace, reads: wantDebug ? readMeta : null } });
-    }
+    const out = { ok: true, wrote: `tickets:${ymd}:${slot}`, counts: {
+      lockedGames: lockedGames.length, combined: combined.length, vbl: vblSlot.length,
+      btts: tickets.btts.length, ou25: tickets.ou25.length, fh_ou15: tickets.fh_ou15.length, htft: tickets.htft.length
+    }};
 
-    // --- rangiranje za izbor ---
-    const sorted = baseArr.slice().sort((a,b)=> byStrength(a,b));
-
-    // --- grupisanje za 4×4 ---
-    const groups = { btts:[], ou25:[], htft:[], fh_ou15:[] };
-    for (const it of baseArr) {
-      const m = it?.markets || {};
-      if (m?.btts) {
-        const p = pickPrice(m.btts.yes);
-        if (p && p >= MIN_ODDS) groups.btts.push({ it, price:p, books:m?.btts?.books_count, pick:"yes" });
-      }
-      if (m?.ou25) {
-        const p = pickPrice(m.ou25.over);
-        if (p && p >= MIN_ODDS) groups.ou25.push({ it, price:p, books:m?.ou25?.books_count, pick:"over" });
-      }
-      if (m?.htft) {
-        const hh = pickPrice(m.htft.hh);
-        const aa = pickPrice(m.htft.aa);
-        const chosen = (hh && aa) ? (hh >= aa ? {p:hh, code:"hh"} : {p:aa, code:"aa"}) : (hh ? {p:hh, code:"hh"} : (aa ? {p:aa, code:"aa"} : null));
-        if (chosen && chosen.p >= MIN_ODDS) groups.htft.push({ it, price:chosen.p, books:m?.htft?.books_count, pick:chosen.code });
-      }
-      if (m?.fh_ou15) {
-        const p = pickPrice(m.fh_ou15.over);
-        if (p && p >= MIN_ODDS) groups.fh_ou15.push({ it, price:p, books:m?.fh_ou15?.books_count, pick:"over" });
-      }
-    }
-    for (const k of Object.keys(groups)) groups[k].sort((a,b)=> byStrength(a.it,b.it));
-
-    // --- izaberi top ---
-    const top = {
-      btts: groups.btts.slice(0,4),
-      ou25: groups.ou25.slice(0,4),
-      htft: groups.htft.slice(0,4),
-      fh_ou15: groups.fh_ou15.slice(0,4)
-    };
-
-    const totalNew = top.btts.length + top.ou25.length + top.htft.length + top.fh_ou15.length;
-    const keySlot = `tickets:${ymd}:${slot}`;
-
-    if (totalNew === 0) {
-      // No-clobber za tiket
-      trace.push({ note:"no-clobber (no-valid-candidates)" });
-      return res.status(200).json({ ok:true, ymd, slot, source, counts:{btts:0,ou25:0,htft:0,fh_ou15:0}, debug:{ trace } });
-    }
-
-    // --- snap tiketa ---
-    const snap = { btts:[], ou25:[], htft:[], fh_ou15:[] };
-    for (const row of top.btts)    snap.btts.push(snapshotItem(row.it,   "btts",     row.price, row.books, row.pick));
-    for (const row of top.ou25)    snap.ou25.push(snapshotItem(row.it,   "ou25",     row.price, row.books, row.pick));
-    for (const row of top.htft)    snap.htft.push(snapshotItem(row.it,   "htft",     row.price, row.books, row.pick));
-    for (const row of top.fh_ou15) snap.fh_ou15.push(snapshotItem(row.it,"fh_ou15",  row.price, row.books, row.pick));
-
-    // upiši tiket po slotu, a dnevni samo ako ne postoji
-    await kvSET(keySlot, snap, trace);
-    const { raw:rawDay } = await kvGETraw(`tickets:${ymd}`, trace);
-    const dayValue = toJson(rawDay);
-    const jDay = dayValue.value && typeof dayValue.value === "object" ? dayValue.value : null;
-    const hasDay = jDay && (Array.isArray(jDay.btts)||Array.isArray(jDay.ou25)||Array.isArray(jDay.htft)||Array.isArray(jDay.fh_ou15));
-    if (!hasDay) await kvSET(`tickets:${ymd}`, snap, trace);
-
-    // --- NEW: pripremi Top-3 iz sorted (uz snapshot) ---
-    const top3 = [];
-    for (const it of sorted.slice(0, 3)) {
-      const mp = marketPickFromItem(it);
-      if (!mp) continue;
-      top3.push({ it, ...mp });
-    }
-
-    // --- NEW: merge Top-3 + 4×4 u vb:day:<ymd>:combined (no-clobber & dedup) ---
-    await mergeCombined({ ymd, slot, top3Items: top3.map(x=>x.it), ticketsSnap: snap, trace, wantDebug });
-
-    const counts = { btts: snap.btts.length, ou25: snap.ou25.length, htft: snap.htft.length, fh_ou15: snap.fh_ou15.length };
-    return res.status(200).json({ ok:true, ymd, slot, source, tickets_key:keySlot, counts, min_odds:MIN_ODDS, debug:{ trace, reads: wantDebug ? readMeta : null } });
-
+    if (debug) out.debug = { ymd, slot, ts: new Date().toISOString() };
+    return res.status(200).json(out);
   } catch (e) {
-    return res.status(200).json({ ok:false, error:String(e?.message||e) });
+    return res.status(200).json({ ok: false, error: String(e?.message || e) });
   }
 }
