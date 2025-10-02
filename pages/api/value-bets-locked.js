@@ -1,5 +1,6 @@
 // pages/api/value-bets-locked.js
 // UVEK puni kartice (home/away/league/kickoff + aliasi) i vraća offers (odds) iz KV.
+// Plus: filtrira "rezervne", "U-lige (U23/U21/U20/U19/U18/U17...)" i ženske/W lige.
 // Slot prozori: late = 00:00–09:59, am = 10:00–14:59, pm = 15:00–23:59 (Europe/Belgrade).
 // Fallback na izvore ID-eva: vb-locked:kv:hit -> vbl_full:<ymd>:<slot> -> vbl_full:<ymd> -> vb:day:<ymd>:union.
 // AF pozivi cap: late≤1000 / am≤2000 / pm≤3000 (samo za expand).
@@ -22,6 +23,47 @@ const ODDS_KEYS = [
   (id) => `odds:byFixture:${id}`,
   (id) => `odds:${id}`,
 ];
+
+/** -------------------- BLOK LISTA LIGA -------------------- */
+// Pazimo na false-positive (npr. "World Cup" ne treba blokirati iako sadrži "W").
+const RE_YOUTH = /\bU(?:23|22|21|20|19|18|17|16|15)\b/i;  // U23, U21, U20...
+const RE_YOUTH_WORDS = /\b(under\s?(?:23|22|21|20|19|18|17|16|15)|primavera|youth|junior[es]?|sub\s?(?:23|22|21|20|19|18|17|16|15))\b/i;
+
+const RE_RESERVE = /\b(reserve|res\.|reserves)\b/i;
+
+const RE_WOMEN = new RegExp(
+  [
+    // women (razni jezici/oblici)
+    "\\bwomen'?s?\\b",
+    "\\bfemeni\\w*\\b",    // femenino, feminina, féminin, féminin(e), femenil
+    "\\blad(?:y|ies)\\b",  // lady, ladies
+    // ' W ' liga (ali ne 'World')
+    "(?<!world)\\sW(\\s|\\b|[-)]|$)",
+    "\\bW-?league\\b",
+    "\\bW\\.?\\s?cup\\b"  // ako eksplicitno označena ženska W Cup
+  ].join("|"),
+  "i"
+);
+
+// Pomoćno: bezbedno dohvatimo string
+function sval(x) { return (x == null) ? "" : String(x); }
+
+function isBlockedLeague(leagueNameRaw) {
+  const name = sval(leagueNameRaw).trim();
+  if (!name) return false;
+
+  // Women
+  if (RE_WOMEN.test(name)) return true;
+
+  // Youth/U
+  if (RE_YOUTH.test(name) || RE_YOUTH_WORDS.test(name)) return true;
+
+  // Reserve
+  if (RE_RESERVE.test(name)) return true;
+
+  return false;
+}
+/** --------------------------------------------------------- */
 
 function ymdNow(tz = TZ) {
   const d = new Date(new Date().toLocaleString("en-US", { timeZone: tz }));
@@ -78,6 +120,9 @@ function normalizeOne(row, id) {
   const league = row.league || row.leagueName || row?.league?.name || null;
   const kickoff = row.kickoff || row.start || row.startTime || row?.fixture?.date || null;
   if (!home || !away || !kickoff) return null;
+  // BLOKIRAJ po nazivu lige
+  if (isBlockedLeague(league)) return null;
+
   return {
     id: id ?? row.id,
     home, away, league, kickoff,
@@ -235,7 +280,7 @@ export default async function handler(req, res) {
     const ymd = sanitizeYmd(req.query.ymd) || ymdNow(TZ);
     const slot = sanitizeSlot(req.query.slot) || detectSlot(TZ);
 
-    // 1) Seeds (iz locked) – često već pune stavke
+    // 1) Seeds (iz locked) – često već pune stavke (tu već čistimo blokirane lige)
     const seeds = await readLockedSeeds();
     const seedsMap = new Map(seeds.map(x => [x.id, x]));
 
@@ -247,16 +292,17 @@ export default async function handler(req, res) {
       return !k || inSlotWindow(k, slot); // ako nemamo kickoff još, dozvoli (expand će kasnije filtrirati)
     });
 
-    // 3) Upotpuni detalje (expand) samo za nedostajuće, kasnije ćemo finalno filtrirati po slotu
+    // 3) Upotpuni detalje (expand) samo za nedostajuće
     const haveMap = new Map(seeds.map(x => [x.id, x]));
     const expanded = await expandMissing(ids, haveMap, { ymd, slot });
     for (const e of expanded) haveMap.set(e.id, e);
 
-    // 4) Sada imamo kickoff vrednosti – filtriraj tačno po slot prozoru i sort po vremenu
+    // 4) Finalni izbor: slot prozor + izbaciti blokirane lige + sort po kickoff
     const detailed = ids
       .map(id => haveMap.get(id))
       .filter(Boolean)
       .filter(g => inSlotWindow(g.kickoff, slot))
+      .filter(g => !isBlockedLeague(g.league)) // <- ključna linija: ukloni rezervne/U/W lige
       .sort((a, b) => String(a.kickoff).localeCompare(String(b.kickoff)))
       .slice(0, 15);
 
