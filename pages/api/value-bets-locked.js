@@ -1,19 +1,17 @@
 // pages/api/value-bets-locked.js
-// Vraća finalnih do 15 mečeva za slot: pune kartice + odds, bez Reserve/U/W, sa hard BLOCKED_LEAGUE_IDS.
-// Odds-gate: preferira sa kvotama; ako ostane <6, bezbedan fallback do 6 bez odds.
-// Nikad 500: u grešci vraćamo { ok:false, error } sa 200.
+// Vraća do 15 mečeva za slot: pune kartice + (ako postoje) odds/edge.
+// Ako nema games u locked feedu, dopunjava detalje iz vb:fixture:<id> (KV keš).
+// Uklanja Reserve/U/W lige i poštuje slot prozore. Nema eksternih API poziva.
 
 import * as s from "../../lib/kv-read";
 
 export const config = { api: { bodyParser: false } };
 
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
-const SLOT_CAPS = { late: 1000, am: 2000, pm: 3000 };
-const API_HOST = "https://v3.football.api-sports.io";
 
-// Hard blacklist po league ID-u
+// Hard blacklist po league ID-u (opciono)
 const BLOCKED_LEAGUE_IDS = [
-  // npr 128, 71 ...
+  // npr: 128, 71,
 ];
 
 // Regex blokovi po nazivu lige
@@ -44,17 +42,16 @@ function sanitizeYmd(v){
   const sVal = decodeURIComponent(String(v || "")).trim(); 
   return /^\d{4}-\d{2}-\d{2}$/.test(sVal) ? sVal : ymdNow();
 }
-function sanitizeSlot(v){
-  const sVal = decodeURIComponent(String(v || "")).trim().toLowerCase();
-  return /^(am|pm|late)$/.test(sVal) ? sVal : detectSlot();
-}
 function detectSlot(){
   const h = Number(new Date(new Date().toLocaleString("en-US", { timeZone: TZ })).getHours());
   if (h < 10) return "late";
   if (h < 15) return "am";
   return "pm";
 }
-
+function sanitizeSlot(v){
+  const sVal = decodeURIComponent(String(v || "")).trim().toLowerCase();
+  return /^(am|pm|late)$/.test(sVal) ? sVal : detectSlot();
+}
 function hourFromIsoLocal(iso) {
   if (typeof iso !== "string") return null;
   const m = iso.match(/T(\d{2}):(\d{2})/);
@@ -68,7 +65,6 @@ function inSlotWindow(kickoffIso, slot) {
   if (slot === "pm")   return h >= 15 && h <= 23;
   return true;
 }
-
 function uniqueIds(arr) {
   const seen = new Set(), out = [];
   for (const v of Array.isArray(arr) ? arr : []) {
@@ -78,55 +74,31 @@ function uniqueIds(arr) {
   return out;
 }
 
-async function readLockedSeeds() {
-  // Preferiraj pune stavke iz locked games (ako postoje)
-  const seeds = [];
-  try {
-    const games = await s.kvGet("vb-locked:kv:hit:games");
-    if (Array.isArray(games)) {
-      for (const g of games) {
-        if (!g) continue;
-        const leagueId = g.leagueId ?? g?.league?.id ?? null;
-        const league = g.leagueName ?? g.league ?? null;
-        if (isBlockedLeagueName(league)) continue;
-        if (typeof leagueId === "number" && BLOCKED_LEAGUE_IDS.includes(leagueId)) continue;
-        if (!g.kickoff || !g.home || !g.away) continue;
-        seeds.push({
-          id: g.id, home:g.home, away:g.away, league: league, leagueId,
-          kickoff: g.kickoff, homeTeam:g.home, awayTeam:g.away, leagueName:league,
-          start:g.kickoff, startTime:g.kickoff, odds: g.odds ?? null, edge: g.edge ?? null
-        });
-      }
-    }
-  } catch {}
-  // Ako nema games, bar pročitaj id listu (bez detalja)
-  if (!seeds.length) {
-    try {
-      const ids = uniqueIds(await s.kvGet("vb-locked:kv:hit") || []);
-      for (const id of ids) seeds.push({ id });
-    } catch {}
-  }
-  // uniq
-  const map = new Map(seeds.map(x => [x.id, x]));
-  return Array.from(map.values());
-}
-
+// Batch: pročitaj odds iz KV
 async function readOddsBulk(ids) {
   const out = new Map();
   if (!ids.length) return out;
-  const cmds = [];
-  const keyIndex = [];
-  for (const id of ids) {
-    const k = `vb-odds:last:${id}`;
-    cmds.push(["GET", k]); keyIndex.push([id, k]);
-  }
+  const cmds = ids.map(id => ["GET", `vb-odds:last:${id}`]);
   let resp = null;
   try { resp = await s.kvPipeline(cmds); } catch { resp = null; }
-  if (!resp || !Array.isArray(resp)) return out;
-  for (let i = 0; i < resp.length; i++) {
-    const [id] = keyIndex[i];
-    const val = resp[i]?.result ?? null;
-    out.set(id, val ?? null);
+  if (Array.isArray(resp)) {
+    ids.forEach((id, i) => out.set(id, resp[i]?.result ?? null));
+  }
+  return out;
+}
+
+// Batch: pročitaj fixture meta (home/away/league/kickoff) iz KV
+async function readFixturesBulk(ids) {
+  const out = new Map();
+  if (!ids.length) return out;
+  const cmds = ids.map(id => ["GET", `vb:fixture:${id}`]);
+  let resp = null;
+  try { resp = await s.kvPipeline(cmds); } catch { resp = null; }
+  if (Array.isArray(resp)) {
+    ids.forEach((id, i) => {
+      const v = resp[i]?.result ?? null;
+      if (v && typeof v === "object") out.set(id, v);
+    });
   }
   return out;
 }
@@ -134,113 +106,101 @@ async function readOddsBulk(ids) {
 export default async function handler(req, res) {
   try {
     res.setHeader("Cache-Control", "no-store");
-    const ymd = sanitizeYmd(req.query.ymd);
+    const ymd  = sanitizeYmd(req.query.ymd);
     const slot = sanitizeSlot(req.query.slot);
 
-    // 1) Seeds iz locked (preferira pune stavke)
-    const seeds = await readLockedSeeds();
-    const seedsMap = new Map(seeds.map(x => [x.id, x]));
+    // 1) Probaj locked games (pune stavke)
+    let games = [];
+    try {
+      const g = await s.kvGet("vb-locked:kv:hit:games");
+      if (Array.isArray(g)) games = g;
+    } catch {}
 
-    // 2) Fallback izvori ID-eva (ako locked prazan)
+    // 2) Ako nema punih stavki, uzmi ID listu pa dopuni detalje iz vb:fixture:<id>
     let ids = [];
-    if (!seeds.length) {
-      const chain = [
-        `vbl_full:${ymd}:${slot}`,
-        `vbl_full:${ymd}`,
-        `vb:day:${ymd}:union`,
-      ];
-      for (const k of chain) {
-        try {
-          const v = await s.kvGet(k);
-          ids = uniqueIds(v);
-          if (ids.length) break;
-        } catch {}
-      }
+    if (!games.length) {
+      try { ids = uniqueIds(await s.kvGet("vb-locked:kv:hit") || []); } catch { ids = []; }
       if (!ids.length) {
-        return res.status(200).json({
-          items: [], ids: [], games: [],
-          meta: { ymd, slot, source:"vb-locked:kv:hit", ts:new Date().toISOString(), last_odds_refresh:new Date().toISOString(), returned:0, cap:15 }
+        // fallback lanac
+        const chain = [`vbl_full:${ymd}:${slot}`, `vbl_full:${ymd}`, `vb:day:${ymd}:union`];
+        for (const k of chain) {
+          try {
+            const v = await s.kvGet(k);
+            ids = uniqueIds(v);
+            if (ids.length) break;
+          } catch {}
+        }
+      }
+      if (ids.length) {
+        const fixMap = await readFixturesBulk(ids);
+        games = ids.map(id => {
+          const v = fixMap.get(id) || {};
+          return {
+            id,
+            home: v.home ?? v.homeTeam ?? null,
+            away: v.away ?? v.awayTeam ?? null,
+            league: v.leagueName ?? v.league ?? null,
+            leagueId: v.leagueId ?? (v.league && v.league.id) ?? null,
+            kickoff: v.kickoff ?? v.start ?? v.startTime ?? null,
+            homeTeam: v.home ?? v.homeTeam ?? null,
+            awayTeam: v.away ?? v.awayTeam ?? null,
+            leagueName: v.leagueName ?? v.league ?? null,
+            start: v.kickoff ?? v.start ?? v.startTime ?? null,
+            startTime: v.kickoff ?? v.start ?? v.startTime ?? null
+          };
         });
       }
-    } else {
-      ids = seeds.map(x => x.id);
     }
 
-    // 3) Filtriraj po slot prozoru (na osnovu kickoff ako ga imamo) + liga blokovi
-    let prelim = (ids.length ? ids : seeds.map(x=>x.id))
-      .map(id => seedsMap.get(id) || { id })
-      .filter(row => {
-        if (!row.league && !row.kickoff) return true; // biće kompletirano iz front feeda kasnije
-        if (row.league && isBlockedLeagueName(row.league)) return false;
-        if (typeof row.leagueId === "number" && BLOCKED_LEAGUE_IDS.includes(row.leagueId)) return false;
-        if (row.kickoff && !inSlotWindow(row.kickoff, slot)) return false;
-        return true;
-      });
+    // 3) Filtriraj po slot prozoru + liga blokovi
+    games = games.filter(g => {
+      const league = g.leagueName ?? g.league ?? null;
+      if (league && isBlockedLeagueName(league)) return false;
+      const lid = g.leagueId;
+      if (typeof lid === "number" && BLOCKED_LEAGUE_IDS.includes(lid)) return false;
+      if (g.kickoff && !inSlotWindow(g.kickoff, slot)) return false;
+      return true;
+    });
 
-    // 4) Odds-gate preferencija + fallback (<6)
-    // – ako imamo odds u KV ili u seed-u, daj prednost
-    const oddsMap = await readOddsBulk(prelim.map(x => x.id));
-    const withOdds = [];
-    const withoutOdds = [];
-    for (const x of prelim) {
-      const base = seedsMap.get(x.id) || x;
-      const odds = base.odds ?? oddsMap.get(x.id) ?? null;
-      const full = { ...base, odds };
-      if (odds) withOdds.push(full); else withoutOdds.push(full);
-    }
+    // 4) Odds iz KV (bez AF) + sort po kickoff
+    const oddsMap = await readOddsBulk(games.map(g => g.id));
+    games.sort((a,b)=> String(a.kickoff||"").localeCompare(String(b.kickoff||"")));
 
-    // Sort po kickoff
-    withOdds.sort((a,b)=> String(a.kickoff||"").localeCompare(String(b.kickoff||"")));
-    withoutOdds.sort((a,b)=> String(a.kickoff||"").localeCompare(String(b.kickoff||"")));
-
-    let picked = withOdds.slice(0, 15);
-    if (picked.length < 15) picked = picked.concat(withoutOdds.slice(0, 15 - picked.length));
-
-    // Bezbedan fallback do minimuma 6 ako je lista suviše kratka
-    let fallback_used = false;
-    if (picked.length < 6) {
-      const unionDay = uniqueIds(await s.kvGet(`vb:day:${ymd}:union`) || []);
-      for (const id of unionDay) {
-        if (picked.find(p => p.id === id)) continue;
-        const row = await s.kvGet(`vb:fixture:${id}`).catch(()=>null);
-        if (!row) continue;
-        if (isBlockedLeagueName(row.leagueName || row.league)) continue;
-        if (typeof row.leagueId === "number" && BLOCKED_LEAGUE_IDS.includes(row.leagueId)) continue;
-        if (row.kickoff && !inSlotWindow(row.kickoff, slot)) continue;
-        picked.push({
-          id: row.id, home:row.home, away:row.away, league:row.leagueName || row.league, leagueId: row.leagueId ?? null,
-          kickoff: row.kickoff, homeTeam: row.home, awayTeam: row.away, leagueName: row.leagueName || row.league,
-          start: row.kickoff, startTime: row.kickoff, odds: await s.kvGet(`vb-odds:last:${row.id}`).catch(()=>null) ?? null
-        });
-        if (picked.length >= 6) { fallback_used = true; break; }
-      }
-    }
-
-    const items = picked.slice(0, 15).map(g => {
+    // 5) Finalnih do 15
+    const picked = games.slice(0, 15).map(g => {
+      const odds = oddsMap.get(g.id) ?? null;
       const obj = {
-        id: g.id, home: g.home, away: g.away, league: g.league, leagueId: g.leagueId ?? null,
-        kickoff: g.kickoff,
-        homeTeam: g.home ?? g.homeTeam, awayTeam: g.away ?? g.awayTeam,
-        leagueName: g.league ?? g.leagueName,
-        start: g.kickoff, startTime: g.kickoff
+        id: g.id, leagueId: (typeof g.leagueId === "number") ? g.leagueId : null,
+        home: g.home ?? g.homeTeam ?? undefined,
+        away: g.away ?? g.awayTeam ?? undefined,
+        league: g.league ?? g.leagueName ?? undefined,
+        kickoff: g.kickoff ?? g.start ?? g.startTime ?? undefined,
+        homeTeam: g.home ?? g.homeTeam ?? undefined,
+        awayTeam: g.away ?? g.awayTeam ?? undefined,
+        leagueName: g.league ?? g.leagueName ?? undefined,
+        start: g.kickoff ?? g.start ?? g.startTime ?? undefined,
+        startTime: g.kickoff ?? g.start ?? g.startTime ?? undefined
       };
-      if (g.odds) obj.odds = g.odds;
-      if (g.edge) obj.edge = g.edge;
+      if (odds) obj.odds = odds;
       return obj;
     });
 
+    // 6) Meta
     const metaRaw = await s.kvGet("vb-locked:kv:hit:meta").catch(()=>null);
     const nowIso = new Date().toISOString();
     const meta = {
-      ymd, slot, source: "vb-locked:kv:hit",
+      ymd, slot, source:"vb-locked:kv:hit",
       ts: metaRaw?.ts || nowIso,
       last_odds_refresh: metaRaw?.last_odds_refresh || nowIso,
-      returned: items.length, cap: 15,
-      fallback_used
+      returned: picked.length, cap: 15,
+      fallback_used: false
     };
 
     return res.status(200).json({
-      items, ids: items.map(x => x.id), games: items, meta
+      items: picked,
+      ids: picked.map(x => x.id),
+      games: picked,
+      meta
     });
   } catch (e) {
     return res.status(200).json({ ok:false, error: String(e?.message || e) });
