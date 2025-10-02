@@ -1,9 +1,8 @@
 // pages/api/value-bets-locked.js
 // Locked feed za UI.
-// - Kad ?slim=1 => items su { id } (kompat sa postojećim UI-jem).
-// - NOVO: ?expand=1 => items su objekti { id, home, away, league, kickoff } do max 15,
-//   dohvaćeni iz API-FOOTBALL (cap-guarded per slot). Ako AF padne, vraćamo fallback {id}.
-// - Fallback izvora liste: vb-locked:kv:hit -> vbl_full:<ymd>:<slot> (KV-only, bez AF poziva).
+// Promena: kad je ?slim=1, sada AUTOMATSKI vraća objekte { id, home, away, league, kickoff }.
+// Ako AF poziv ne uspe ili cap udari, vrati fallback { id } (da UI barem nešto renderuje).
+// Fallback izvora liste: vb-locked:kv:hit -> vbl_full:<ymd>:<slot>. KV-only za listu; AF samo za expand (max 15).
 
 const API_HOST = 'https://v3.football.api-sports.io';
 const SLOT_CAPS = { am:2000, pm:3000, late:1000 };
@@ -86,7 +85,7 @@ async function expandFixtures(ids, { ymd, slot }) {
       out.push({ id, home, away, league, kickoff });
       if (out.length >= 15) break;
     } catch {
-      // na bilo koju grešku, preskoči ovaj id (držimo capove niskim)
+      // na bilo koju grešku, preskoči ovaj id
       continue;
     }
   }
@@ -107,6 +106,7 @@ export default async function handler(req, res) {
       const vbl = (await kvGet(`vbl_full:${ymd}:${slot}`)) || [];
       locked = Array.isArray(vbl) ? vbl.slice(0, 15) : [];
     }
+    const ids = Array.isArray(locked) ? locked.slice(0, 15) : [];
 
     // 2) Meta (realna ili synth)
     const metaRaw = (await kvGet('vb-locked:kv:hit:meta')) || null;
@@ -116,30 +116,36 @@ export default async function handler(req, res) {
       source: 'vb-locked:kv:hit',
       ts: metaRaw?.ts || nowIso,
       last_odds_refresh: metaRaw?.last_odds_refresh || nowIso,
-      returned: Array.isArray(locked) ? Math.min(locked.length, 15) : 0,
+      returned: ids.length,
       cap: 15,
     };
 
     // 3) Items
     let items;
-    const ids = Array.isArray(locked) ? locked.slice(0, 15) : [];
 
-    if (expand) {
-      // proširi iz AF (cap-guarded), do 15 poziva max
-      const rich = await expandFixtures(ids, { ymd, slot });
-      if (slim) {
-        // slim + expand => minimalni objekti
+    if (slim) {
+      // AUTO-EXPAND ZA SLIM: pokušaj da dovučeš minimalna polja;
+      // ako ne uspe (cap/errors), vrati fallback { id }.
+      let rich = [];
+      let expandFailed = false;
+      try { rich = await expandFixtures(ids, { ymd, slot }); }
+      catch { expandFailed = true; }
+
+      if (!expandFailed && Array.isArray(rich) && rich.length > 0) {
         items = rich.map(x => ({ id: x.id, home: x.home, away: x.away, league: x.league, kickoff: x.kickoff }));
+        meta.returned = items.length;
       } else {
-        items = rich;
+        items = ids.map(id => ({ id })); // fallback — barem neće biti prazna kartica
+        meta.returned = items.length;
       }
-      meta.returned = items.length;
     } else {
-      // bez expand: kompatibilno ponašanje (slim => {id}, inače niz ID-eva)
-      if (slim) {
-        items = ids.map(id => ({ id }));
+      // Legacy ponašanje kad slim nije 1
+      if (expand) {
+        const rich = await expandFixtures(ids, { ymd, slot });
+        items = rich;
+        meta.returned = Array.isArray(rich) ? rich.length : 0;
       } else {
-        items = ids;
+        items = ids; // niz ID-eva
       }
     }
 
