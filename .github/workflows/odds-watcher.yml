@@ -2,56 +2,108 @@ name: odds-watcher
 
 on:
   schedule:
-    # Europe/Belgrade 00:00  -> UTC 22:00 (prethodni dan)
-    - cron: "0 22 * * *"
-    # Europe/Belgrade 10:00  -> UTC 08:00
-    - cron: "0 8 * * *"
-    # Europe/Belgrade 15:00  -> UTC 13:00
-    - cron: "0 13 * * *"
+    # Svakog sata u :05 (UTC). Unutar job-a proveravamo Europe/Belgrade vreme
+    # i zovemo endpoint SAMO kada je 00, 10 ili 15h lokalno.
+    - cron: '5 * * * *'
   workflow_dispatch:
+    inputs:
+      ymd:
+        description: 'YYYY-MM-DD (opciono, default je današnji u Europe/Belgrade)'
+        required: false
+      slot:
+        description: 'late | am | pm (opciono, auto-izračun po Europe/Belgrade ako nije zadato)'
+        required: false
+      debug:
+        description: 'Set to 1 for debug response'
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: odds-watcher
+  cancel-in-progress: true
 
 jobs:
-  run:
+  refresh-odds:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      BASE_URL: ${{ secrets.BASE_URL }}
+      TZ_REGION: Europe/Belgrade
     steps:
-      - name: Set up job
-        run: echo "Starting odds-watcher"
-
-      - name: Install jq
+      - name: Compute Belgrade date/slot (or use inputs)
+        id: calc
+        shell: bash
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq
+          set -euo pipefail
 
-      - name: Compute YMD & SLOT (Europe/Belgrade)
-        id: when
-        env:
-          TZ: Europe/Belgrade
+          # Ako su prosleđeni ručni inputi, koristi njih
+          IN_YMD="${{ github.event.inputs.ymd || '' }}"
+          IN_SLOT="${{ github.event.inputs.slot || '' }}"
+          IN_DEBUG="${{ github.event.inputs.debug || '' }}"
+
+          if [ -n "$IN_YMD" ]; then
+            YMD="$IN_YMD"
+          else
+            YMD="$(TZ=$TZ_REGION date +%F)"
+          fi
+
+          if [ -n "$IN_SLOT" ]; then
+            SLOT="$IN_SLOT"
+          else
+            HOUR_BG="$(TZ=$TZ_REGION date +%H)"
+            if [ "$HOUR_BG" -lt 10 ]; then
+              SLOT="late"
+            elif [ "$HOUR_BG" -lt 15 ]; then
+              SLOT="am"
+            else
+              SLOT="pm"
+            fi
+          fi
+
+          # Trigger samo kada je 00/10/15h lokalno (osim ako je ručni run)
+          if [ -n "$IN_SLOT" ] || [ -n "$IN_YMD" ]; then
+            TRIGGER="1"
+          else
+            HOUR_BG_NOW="$(TZ=$TZ_REGION date +%H)"
+            case "$HOUR_BG_NOW" in
+              00|10|15) TRIGGER="1" ;;
+              *)        TRIGGER="0" ;;
+            esac
+          fi
+
+          # Debug flag
+          if [ "$IN_DEBUG" = "1" ]; then
+            DBG="&debug=1"
+          else
+            DBG=""
+          fi
+
+          echo "YMD=$YMD"           >> "$GITHUB_ENV"
+          echo "SLOT=$SLOT"         >> "$GITHUB_ENV"
+          echo "TRIGGER=$TRIGGER"   >> "$GITHUB_ENV"
+          echo "DBG=$DBG"           >> "$GITHUB_ENV"
+          echo "NOW_BG=$(TZ=$TZ_REGION date '+%Y-%m-%d %H:%M:%S %Z')" >> "$GITHUB_ENV"
+
+          echo "Computed: YMD=$YMD SLOT=$SLOT NOW_BG=$NOW_BG TRIGGER=$TRIGGER"
+
+      - name: Skip if not slot time (Belgrade)
+        if: env.TRIGGER != '1'
         run: |
-          YMD=$(TZ=Europe/Belgrade date +%F)
-          HOUR=$(TZ=Europe/Belgrade date +%H)
-          if [ "$HOUR" -lt 12 ]; then SLOT="am"; elif [ "$HOUR" -lt 17 ]; then SLOT="pm"; else SLOT="late"; fi
-          echo "ymd=$YMD"   >> $GITHUB_OUTPUT
-          echo "slot=$SLOT" >> $GITHUB_OUTPUT
-          echo "Belgrade now: $YMD $HOUR:00 -> slot=$SLOT"
+          echo "Not a slot boundary in Europe/Belgrade (NOW=$NOW_BG). Skipping call."
 
-      - name: Rebuild snapshot (+union)
-        env:
-          BASE: ${{ secrets.BASE_URL }}
+      - name: Call refresh-odds (once per slot)
+        if: env.TRIGGER == '1'
+        shell: bash
         run: |
-          curl -fsS "$BASE/api/cron/rebuild?ymd=${{ steps.when.outputs.ymd }}&slot=${{ steps.when.outputs.slot }}&debug=1"
+          set -euo pipefail
+          if [ -z "$BASE_URL" ]; then
+            echo "Missing BASE_URL secret"; exit 1
+          fi
 
-      - name: Apply learning (write vbl_full)
-        env:
-          BASE: ${{ secrets.BASE_URL }}
-        run: |
-          curl -fsS "$BASE/api/cron/apply-learning?ymd=${{ steps.when.outputs.ymd }}&slot=${{ steps.when.outputs.slot }}&debug=1"
-
-      - name: Refresh odds (guarded + lock/meta)
-        env:
-          BASE: ${{ secrets.BASE_URL }}
-        run: |
-          curl -fsS "$BASE/api/cron/refresh-odds?ymd=${{ steps.when.outputs.ymd }}&slot=${{ steps.when.outputs.slot }}&debug=1"
-
-      - name: Complete job
-        run: echo "Done."
+          URL="${BASE_URL%/}/api/cron/refresh-odds?ymd=${YMD}&slot=${SLOT}${DBG}"
+          echo "Calling: $URL (NOW_BG=$NOW_BG)"
+          # --fail: exit on HTTP >=400; --show-error: print error; --silent: cleaner logs
+          curl --fail --show-error --silent "$URL"
+          echo
