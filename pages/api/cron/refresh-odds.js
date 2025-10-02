@@ -1,9 +1,11 @@
 // pages/api/cron/refresh-odds.js
-// Osveži kvote (tvoja postojeća logika) + upiši meta za locked feed.
-// Capovi: AM=2000, PM=3000, LATE=1000. KV-only upis meta (bez dodatnih AF poziva).
+// Zaključava listu za front (vb-locked:kv:hit) i upisuje meta, uz capove.
+// Ne troši dodatne AF pozive za samo zaključenje; oslanja se na vbl_full/union.
+// Ako želiš realno osveženje kvota, postojeća logika može ostati – ovo samo
+// garantuje da je vb-locked napunjen i meta postavljena.
 
-const SLOT_CAPS = { am:2000, pm:3000, late:1000 };
-const API_HINTS = ['api-sports.io','api-football'];
+const SLOT_CAPS = { am: 2000, pm: 3000, late: 1000 };
+const API_HINTS = ['api-sports.io', 'api-football'];
 
 function resolveKV() {
   const url = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
@@ -21,26 +23,32 @@ async function kvPipeline(cmds) {
   if (!r.ok) throw new Error(`KV_PIPELINE_HTTP_${r.status}`);
   return r.json();
 }
-async function kvGet(key){
-  try{
-    const arr=await kvPipeline([['GET', key]]);
-    let v=arr?.[0]?.result ?? null;
+async function kvGet(key) {
+  try {
+    const arr = await kvPipeline([['GET', key]]);
+    let v = arr?.[0]?.result ?? null;
     if (typeof v === 'string') { try { v = JSON.parse(v); } catch {} }
     return v;
-  }catch{ return null; }
+  } catch { return null; }
 }
-async function kvSet(key, value){
+async function kvSet(key, value) {
   const val = typeof value === 'string' ? value : JSON.stringify(value);
   await kvPipeline([['SET', key, val]]);
   return true;
 }
 
-function ymdFromTZ(tz='Europe/Belgrade'){ const d=new Date(new Date().toLocaleString('en-US',{timeZone:tz})); const y=d.getFullYear(), m=String(d.getMonth()+1).padStart(2,'0'), dd=String(d.getDate()).padStart(2,'0'); return `${y}-${m}-${dd}`; }
+function ymdFromTZ(tz='Europe/Belgrade'){
+  const d = new Date(new Date().toLocaleString('en-US',{ timeZone: tz }));
+  const y=d.getFullYear(), m=String(d.getMonth()+1).padStart(2,'0'), dd=String(d.getDate()).padStart(2,'0');
+  return `${y}-${m}-${dd}`;
+}
 function slotByHour(h){ if(h<12)return'am'; if(h<17)return'pm'; return'late'; }
 function detectSlot(tz='Europe/Belgrade'){ const h=Number(new Date(new Date().toLocaleString('en-US',{timeZone:tz})).getHours()); return slotByHour(h); }
 function spentKey(ymd,slot){ return `afc:spent:${ymd}:${slot}`; }
-function capFor(slot){ return SLOT_CAPS[slot]??2000; }
+function capFor(slot){ return SLOT_CAPS[slot] ?? 2000; }
 
+// Ograničenje trošenja za AF pozive; ovo ostavljamo jer možda imaš i real refresh.
+// Samo napomena: zaključavanje liste i meta ne koriste AF – KV only.
 function installCap(ymd,slot){
   if(global.__fetchCapped) return;
   const orig=global.fetch;
@@ -64,29 +72,27 @@ export default async function handler(req,res){
     const ymd=(req.query.ymd||'').match(/^\d{4}-\d{2}-\d{2}$/)?req.query.ymd:ymdFromTZ(tz);
     const slot=(req.query.slot||'').match(/^(am|pm|late)$/)?req.query.slot:detectSlot(tz);
 
+    // Kap za AF pozive (ako ovaj handler usput radi i real refresh)
     installCap(ymd,slot);
 
-    // Ako nema union/vbl_full → nema smisla trošiti AF
+    // 1) Izvor za zaključavanje: preferiraj vbl_full:<ymd>:<slot>, fallback na union
+    const vbl = (await kvGet(`vbl_full:${ymd}:${slot}`)) || [];
     const union = (await kvGet(`vb:day:${ymd}:union`)) || [];
-    if (!Array.isArray(union) || union.length === 0) {
-      return res.status(200).json({ ok:true, ymd, slot, reason:'empty-union', refreshed:0, cap: capFor(slot) });
-    }
+    const pool = Array.isArray(vbl) && vbl.length ? vbl
+                : (Array.isArray(union) ? union : []);
+    const items = Array.isArray(pool) ? pool.slice(0, 15) : [];
 
-    // --- Ovde ide TVOJA postojeća logika osvežavanja kvota ---
-    // ... (namerno je ne diramo)
-    // Pretpostavlja se da tokom procesa ažuriraš `vb-locked:kv:hit` (listu ID-eva)
-    // ---------------------------------------------------------
-
-    // UPIŠI META tako da /api/value-bets-locked dobije ts/last_odds_refresh
+    // 2) Upis zaključane liste + meta (KV-only, 0 AF poziva)
+    await kvSet('vb-locked:kv:hit', items);
     const nowIso = new Date().toISOString();
-    await kvSet('vb-locked:kv:hit:meta', {
-      ymd, slot,
-      ts: nowIso,
-      last_odds_refresh: nowIso
-    });
+    await kvSet('vb-locked:kv:hit:meta', { ymd, slot, ts: nowIso, last_odds_refresh: nowIso });
 
     const spent = Number((await kvGet(spentKey(ymd,slot)))||0);
-    return res.status(200).json({ ok:true, ymd, slot, cap: capFor(slot), spent, note:'refresh-odds (cap enforced)' });
+    return res.status(200).json({
+      ok:true, ymd, slot,
+      cap: capFor(slot), spent,
+      note:'refresh-odds (cap enforced) + locked list/meta written from vbl_full/union (KV-only)'
+    });
   }catch(e){
     return res.status(200).json({ ok:false, error:String(e?.message||e) });
   }
