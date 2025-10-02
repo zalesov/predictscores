@@ -1,8 +1,15 @@
 // pages/api/value-bets-locked.js
-// Vraća zaključanu listu za UI. Kad je slim=1, items su OBJEKTI { id } da UI ne renderuje praznu karticu.
-// Fallback: ako vb-locked nema stavke, koristi vbl_full:<ymd>:<slot> (prvih 15).
-// KV-only (bez API-Football poziva).
+// Locked feed za UI.
+// - Kad ?slim=1 => items su { id } (kompat sa postojećim UI-jem).
+// - NOVO: ?expand=1 => items su objekti { id, home, away, league, kickoff } do max 15,
+//   dohvaćeni iz API-FOOTBALL (cap-guarded per slot). Ako AF padne, vraćamo fallback {id}.
+// - Fallback izvora liste: vb-locked:kv:hit -> vbl_full:<ymd>:<slot> (KV-only, bez AF poziva).
 
+const API_HOST = 'https://v3.football.api-sports.io';
+const SLOT_CAPS = { am:2000, pm:3000, late:1000 };
+const API_HINTS = ['api-sports.io','api-football'];
+
+/* ---------- KV helpers (Upstash pipeline + Bearer) ---------- */
 function resolveKV() {
   const url = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
   const token = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
@@ -13,7 +20,7 @@ async function kvPipeline(cmds) {
   const { url, token } = resolveKV();
   const r = await fetch(`${url}/pipeline`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+    headers: { 'content-type':'application/json', authorization: `Bearer ${token}` },
     body: JSON.stringify(cmds),
   });
   if (!r.ok) throw new Error(`KV_PIPELINE_HTTP_${r.status}`);
@@ -25,20 +32,65 @@ async function kvGet(key) {
     let v = arr?.[0]?.result ?? null;
     if (typeof v === 'string') { try { v = JSON.parse(v); } catch {} }
     return v;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
+/* ---------- vreme/slot + caps ---------- */
 function ymdFromTZ(tz='Europe/Belgrade'){
-  const d = new Date(new Date().toLocaleString('en-US', { timeZone: tz }));
-  const y = d.getFullYear(), m = String(d.getMonth()+1).padStart(2,'0'), dd = String(d.getDate()).padStart(2,'0');
+  const d=new Date(new Date().toLocaleString('en-US',{ timeZone: tz }));
+  const y=d.getFullYear(), m=String(d.getMonth()+1).padStart(2,'0'), dd=String(d.getDate()).padStart(2,'0');
   return `${y}-${m}-${dd}`;
 }
 function slotByHour(h){ if(h<12)return'am'; if(h<17)return'pm'; return'late'; }
 function detectSlot(tz='Europe/Belgrade'){
-  const h = Number(new Date(new Date().toLocaleString('en-US',{ timeZone: tz })).getHours());
+  const h=Number(new Date(new Date().toLocaleString('en-US',{timeZone:tz})).getHours());
   return slotByHour(h);
+}
+function spentKey(ymd,slot){ return `afc:spent:${ymd}:${slot}`; }
+function capFor(slot){ return SLOT_CAPS[slot] ?? 2000; }
+
+/* ---------- cap-aware fetch za AF (inkrement best-effort) ---------- */
+async function countedAF(url, opts, ymd, slot) {
+  const u = typeof url==='string' ? url : String(url?.url||url);
+  if (!API_HINTS.some(h=>u.includes(h))) return fetch(url, opts);
+
+  let spent = Number((await kvGet(spentKey(ymd,slot)))||0);
+  if (spent >= capFor(slot)) throw new Error(`CAP_REACHED:${slot}:${spent}/${capFor(slot)}`);
+  const resp = await fetch(url, opts);
+  try { await kvPipeline([['SET', spentKey(ymd,slot), String(spent+1) ]]); } catch {}
+  return resp;
+}
+
+/* ---------- expand iz API-FOOTBALL (max 15 id-eva) ---------- */
+async function expandFixtures(ids, { ymd, slot }) {
+  const keyRaw = process.env.API_FOOTBALL_KEY || process.env.NEXT_PUBLIC_API_FOOTBALL_KEY;
+  const apiKey = (keyRaw||'').trim();
+  if (!apiKey || !Array.isArray(ids) || ids.length===0) return [];
+
+  const out = [];
+  for (const id of ids) {
+    try {
+      const url = `${API_HOST}/fixtures?id=${id}&timezone=Europe/Belgrade`;
+      const r = await countedAF(url, { headers:{ 'x-apisports-key': apiKey, 'accept':'application/json' } }, ymd, slot);
+      const data = await r.json();
+
+      // detektuj "errors" i preskoči taj id
+      if (data?.errors && Object.keys(data.errors).length>0) continue;
+
+      const row = Array.isArray(data?.response) ? data.response[0] : null;
+      const home = row?.teams?.home?.name || null;
+      const away = row?.teams?.away?.name || null;
+      const league = row?.league?.name || null;
+      const kickoff = row?.fixture?.date || null;
+
+      out.push({ id, home, away, league, kickoff });
+      if (out.length >= 15) break;
+    } catch {
+      // na bilo koju grešku, preskoči ovaj id (držimo capove niskim)
+      continue;
+    }
+  }
+  return out;
 }
 
 export default async function handler(req, res) {
@@ -47,22 +99,20 @@ export default async function handler(req, res) {
     const ymd = (req.query.ymd||'').match(/^\d{4}-\d{2}-\d{2}$/) ? req.query.ymd : ymdFromTZ(tz);
     const slot = (req.query.slot||'').match(/^(am|pm|late)$/) ? req.query.slot : detectSlot(tz);
     const slim = String(req.query.slim||'0') === '1';
+    const expand = String(req.query.expand||'0') === '1';
 
-    // 1) Učitaj zaključanu listu
+    // 1) Locked lista ili fallback na vbl_full
     let locked = (await kvGet('vb-locked:kv:hit')) || [];
-
-    // 2) Fallback na vbl_full:<ymd>:<slot> ako zaključana lista nije tu
-    if (!Array.isArray(locked) || locked.length === 0) {
+    if (!Array.isArray(locked) || locked.length===0) {
       const vbl = (await kvGet(`vbl_full:${ymd}:${slot}`)) || [];
       locked = Array.isArray(vbl) ? vbl.slice(0, 15) : [];
     }
 
-    // 3) Meta – realna ako postoji, inače synth "now"
+    // 2) Meta (realna ili synth)
     const metaRaw = (await kvGet('vb-locked:kv:hit:meta')) || null;
     const nowIso = new Date().toISOString();
     const meta = {
-      ymd,
-      slot,
+      ymd, slot,
       source: 'vb-locked:kv:hit',
       ts: metaRaw?.ts || nowIso,
       last_odds_refresh: metaRaw?.last_odds_refresh || nowIso,
@@ -70,13 +120,27 @@ export default async function handler(req, res) {
       cap: 15,
     };
 
-    // 4) Slim=1 → vrati OBJEKTE { id } (UI kompatibilnost); bez slim → sirovi ID-evi
+    // 3) Items
     let items;
-    if (slim) {
-      const ids = Array.isArray(locked) ? locked.slice(0, 15) : [];
-      items = ids.map(id => ({ id }));
+    const ids = Array.isArray(locked) ? locked.slice(0, 15) : [];
+
+    if (expand) {
+      // proširi iz AF (cap-guarded), do 15 poziva max
+      const rich = await expandFixtures(ids, { ymd, slot });
+      if (slim) {
+        // slim + expand => minimalni objekti
+        items = rich.map(x => ({ id: x.id, home: x.home, away: x.away, league: x.league, kickoff: x.kickoff }));
+      } else {
+        items = rich;
+      }
+      meta.returned = items.length;
     } else {
-      items = Array.isArray(locked) ? locked : [];
+      // bez expand: kompatibilno ponašanje (slim => {id}, inače niz ID-eva)
+      if (slim) {
+        items = ids.map(id => ({ id }));
+      } else {
+        items = ids;
+      }
     }
 
     return res.status(200).json({ items, meta });
