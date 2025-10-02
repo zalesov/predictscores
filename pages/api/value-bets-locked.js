@@ -1,184 +1,197 @@
 // pages/api/value-bets-locked.js
-// Returns up to 15 matches for the current slot: full cards + (if present) odds/edge.
-// If locked full items are missing, it fills details from vb:fixture:<id> (KV cache only).
-// Filters out Reserve/U/W leagues and respects slot windows. No external API calls.
+// PURPOSE (no external API calls):
+// - Return the TOP 15 fixtures by highest confidence for the current slot (late/am/pm).
+// - Read odds from KV (vb-odds:last:<fixtureId>) and attach to cards.
+// - Return 4×4 tickets: if tickets:<ymd>:<slot> missing, compute from vb:day:<ymd>:combined as a fallback.
+// - Keep existing budgets and external-call behavior unchanged (this route does KV-only work).
 
 import * as s from "../../lib/kv-read";
 
 export const config = { api: { bodyParser: false } };
 
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
+const BLOCKED_LEAGUE_IDS = []; // add league IDs here if you want to hard-block
 
-// Optional hard blacklist by league ID
-const BLOCKED_LEAGUE_IDS = [
-  // e.g.: 128, 71,
-];
-
-/* ---------------- utilities ---------------- */
-function isBlockedLeagueName(name) {
-  const n = String(name || "").toLowerCase();
-  // crude filters: women/reserve/u-xx
-  if (/\bu\d{2}\b/.test(n)) return true;
-  if (/(women|femin|ladies|female)/i.test(name || "")) return true;
-  if (/(reserve|reserves|b team|ii)$/.test(n)) return true;
-  return false;
+/* ---------------- time & slot helpers ---------------- */
+function nowHourBG() {
+  return Number(new Intl.DateTimeFormat("en-GB", { timeZone: TZ, hour: "2-digit", hour12: false }).format(new Date()));
 }
-function hourInTZ(iso, tz = TZ) {
-  try {
-    const d = typeof iso === "string" ? new Date(iso) : iso;
-    return Number(new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", hour12: false }).format(d));
-  } catch { return NaN; }
-}
-function inSlotWindow(iso, slot) {
-  const h = hourInTZ(iso);
-  if (!Number.isFinite(h)) return true;
-  if (slot === "late") return h < 10;
-  if (slot === "am")   return h >= 10 && h < 15;
-  if (slot === "pm")   return h >= 15 && h <= 23;
-  return true;
-}
-function uniqueIds(arr) {
-  const seen = new Set(), out = [];
-  for (const v of Array.isArray(arr) ? arr : []) {
-    const id = typeof v === "number" ? v : v?.id;
-    if (typeof id === "number" && !seen.has(id)) { seen.add(id); out.push(id); }
-  }
-  return out;
+function todayYmdBG() {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: TZ }).format(new Date());
 }
 function sanitizeYmd(x) {
-  const s = String(x || "").trim();
-  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : new Intl.DateTimeFormat("en-CA", { timeZone: TZ }).format(new Date());
+  const s0 = String(x || "").trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(s0) ? s0 : todayYmdBG();
 }
 function sanitizeSlot(x) {
   const s = String(x || "auto").toLowerCase();
   if (s === "late" || s === "am" || s === "pm") return s;
-  // auto by Belgrade hour
-  const h = Number(new Intl.DateTimeFormat("en-GB", { timeZone: TZ, hour:"2-digit", hour12:false }).format(new Date()));
+  const h = nowHourBG();
   if (h < 10) return "late";
   if (h < 15) return "am";
   return "pm";
 }
 
-/* ---------------- robust KV readers ---------------- */
-function oddsKvFallbackEnv() {
-  // secondary backend used by refresh-odds writer in some deployments
-  const url = (process.env.UPSTASH_KV_REST_URL || "").replace(/\/+$/,"");
-  const token = process.env.UPSTASH_KV_REST_TOKEN || "";
-  return (url && token) ? { url, token } : null;
+/* ---------------- list/window helpers ---------------- */
+function isBlockedLeagueName(name) {
+  const n = String(name || "").toLowerCase();
+  if (/\bu\d{2}\b/.test(n)) return true;
+  if (/(women|femin|ladies|female)/i.test(name || "")) return true;
+  if (/(reserve|reserves|b team|ii)$/.test(n)) return true;
+  return false;
 }
-
-async function kvPipelineDual(cmds) {
-  // 1) primary via shared adapter
+function inSlotWindow(iso, slot) {
+  // Keep the existing hour windows, but final selection will be by confidence (desc)
   try {
-    const r = await s.kvPipeline(cmds);
-    if (Array.isArray(r)) {
-      // if at least one non-null, accept
-      if (r.some(x => (x?.result ?? x?.value ?? null) != null)) return r;
-    }
-  } catch {}
-  // 2) fallback: Upstash KV REST (if configured)
-  const fb = oddsKvFallbackEnv();
-  if (!fb) return null;
-  try {
-    const r = await fetch(`${fb.url}/pipeline`, {
-      method: "POST",
-      headers: { "Authorization": `Bearer ${fb.token}`, "Content-Type": "application/json" },
-      body: JSON.stringify(cmds),
-      cache: "no-store"
-    });
-    if (!r.ok) return null;
-    const j = await r.json().catch(()=>null);
-    return Array.isArray(j) ? j : null;
-  } catch { return null; }
+    const hh = Number(new Intl.DateTimeFormat("en-GB", { timeZone: TZ, hour: "2-digit", hour12: false }).format(new Date(iso)));
+    if (slot === "late") return hh < 10;
+    if (slot === "am")   return hh >= 10 && hh < 15;
+    if (slot === "pm")   return hh >= 15 && hh <= 23;
+    return true;
+  } catch { return true; }
 }
-
-async function kvGetDual(key) {
-  try {
-    const v = await s.kvGet(key);
-    if (v !== undefined && v !== null) return v;
-  } catch {}
-  const fb = oddsKvFallbackEnv();
-  if (!fb) return null;
-  try {
-    const r = await fetch(`${fb.url}/get/${encodeURIComponent(key)}`, {
-      headers: { "Authorization": `Bearer ${fb.token}` },
-      cache: "no-store"
-    });
-    if (!r.ok) return null;
-    const j = await r.json().catch(()=>null);
-    return (j && (j.result ?? j.value)) ?? null;
-  } catch { return null; }
-}
-
-/* Batch: read odds from KV (tries both backends) */
-async function readOddsBulk(ids) {
-  const out = new Map();
-  if (!ids.length) return out;
-  const cmds = ids.map(id => ["GET", `vb-odds:last:${id}`]);
-  let resp = null;
-  try { resp = await kvPipelineDual(cmds); } catch { resp = null; }
-  if (Array.isArray(resp)) {
-    ids.forEach((id, i) => {
-      const payload = resp[i]?.result ?? resp[i]?.value ?? null;
-      let parsed = null;
-      if (payload && typeof payload === "string") { try { parsed = JSON.parse(payload); } catch { parsed = null; } }
-      else if (payload && typeof payload === "object") { parsed = payload; }
-      out.set(id, parsed ?? null);
-    });
+function uniqueIds(arr) {
+  const seen = new Set(), out = [];
+  for (const v of Array.isArray(arr) ? arr : []) {
+    const id = typeof v === "number" ? v : v?.id ?? v?.fixture_id;
+    if (typeof id === "number" && !seen.has(id)) { seen.add(id); out.push(id); }
   }
   return out;
 }
 
-/* Batch: read fixture meta (home/away/league/kickoff) from KV */
+/* ---------------- KV helpers ---------------- */
+async function kvGetSafe(key) {
+  try { return await s.kvGet(key); } catch { return null; }
+}
+async function kvPipelineSafe(cmds) {
+  // try pipeline; if adapter throws, degrade to sequential GETs
+  try {
+    const r = await s.kvPipeline(cmds);
+    if (Array.isArray(r)) return r;
+  } catch {}
+  const out = [];
+  for (const [_, k] of cmds) {
+    // eslint-disable-next-line no-await-in-loop
+    const v = await kvGetSafe(k);
+    out.push({ result: v });
+  }
+  return out;
+}
+
+/* Read minimal per-fixture objects (home/away/league/kickoff) */
 async function readFixturesBulk(ids) {
   const out = new Map();
   if (!ids.length) return out;
   const cmds = ids.map(id => ["GET", `vb:fixture:${id}`]);
-  let resp = null;
-  try { resp = await s.kvPipeline(cmds); } catch { resp = null; }
-  if (!Array.isArray(resp)) {
-    // try fallback once
-    resp = await kvPipelineDual(cmds);
-  }
-  if (Array.isArray(resp)) {
-    ids.forEach((id, i) => {
-      const v = resp[i]?.result ?? resp[i]?.value ?? null;
-      if (v && typeof v === "object") out.set(id, v);
-      else if (typeof v === "string") { try {
-        const obj = JSON.parse(v);
-        if (obj && typeof obj === "object") out.set(id, obj);
-      } catch {} }
-    });
-  }
+  const resp = await kvPipelineSafe(cmds);
+  ids.forEach((id, i) => {
+    const v = resp[i]?.result ?? resp[i]?.value ?? null;
+    if (v && typeof v === "object") out.set(id, v);
+    else if (typeof v === "string") { try { out.set(id, JSON.parse(v)); } catch {} }
+  });
   return out;
 }
 
-/* ---------------- handler ---------------- */
+/* Read odds objects written by refresh-odds (vb-odds:last:<id>) */
+async function readOddsBulk(ids) {
+  const out = new Map();
+  if (!ids.length) return out;
+  const cmds = ids.map(id => ["GET", `vb-odds:last:${id}`]);
+  const resp = await kvPipelineSafe(cmds);
+  ids.forEach((id, i) => {
+    const payload = resp[i]?.result ?? resp[i]?.value ?? null;
+    let parsed = null;
+    if (payload && typeof payload === "string") { try { parsed = JSON.parse(payload); } catch {} }
+    else if (payload && typeof payload === "object") { parsed = payload; }
+    out.set(id, parsed ?? null);
+  });
+  return out;
+}
+
+/* Read combined list (used to borrow confidence if locked items don't carry it) */
+async function readCombined(ymd) {
+  const v = await kvGetSafe(`vb:day:${ymd}:combined`);
+  return Array.isArray(v) ? v : [];
+}
+
+/* Build confidence map from an array of items with fixture id + confidence fields */
+function confidenceMapFrom(arr) {
+  const m = new Map();
+  for (const it of Array.isArray(arr) ? arr : []) {
+    const fid = it?.fixture_id ?? it?.id;
+    if (typeof fid !== "number") continue;
+    const c =
+      (typeof it?.confidence_pct === "number" ? it.confidence_pct : null) ??
+      (typeof it?.confidence === "number" ? it.confidence : null) ??
+      (typeof it?.score === "number" ? it.score : null);
+    if (typeof c === "number") m.set(fid, c);
+  }
+  return m;
+}
+
+/* Generate 4×4 tickets from combined (fallback when tickets key is missing) */
+function buildTicketsFromCombined(combined) {
+  const arr = Array.isArray(combined) ? combined : [];
+  const buckets = { btts: [], ou25: [], fh_ou15: [], htft: [] };
+
+  for (const it of arr) {
+    const mk = String(it?.market_key ?? it?.market ?? it?.type ?? "").toLowerCase();
+    const fid = it?.fixture_id ?? it?.id;
+    if (typeof fid !== "number") continue;
+
+    const confidence =
+      (typeof it?.confidence_pct === "number" ? it.confidence_pct
+        : (typeof it?.confidence === "number" ? it.confidence
+        : (typeof it?.score === "number" ? it.score : 0)));
+
+    const base = {
+      id: fid,
+      confidence_pct: confidence,
+      kickoff: it?.kickoff ?? it?.start ?? it?.startTime,
+      leagueId: it?.leagueId ?? it?.league?.id,
+      league: it?.leagueName ?? it?.league,
+      home: it?.home ?? it?.homeTeam,
+      away: it?.away ?? it?.awayTeam
+    };
+
+    if (mk.includes("btts")) buckets.btts.push(base);
+    else if (mk.includes("ou25") || mk.includes("over_2_5") || mk.includes("over25") || mk.includes("over 2.5")) buckets.ou25.push(base);
+    else if (mk.includes("fh_ou15") || mk.includes("over15_ht") || mk.includes("over 1.5 ht") || mk.includes("ht over 1.5")) buckets.fh_ou15.push(base);
+    else if (mk.includes("htft")) buckets.htft.push(base);
+  }
+
+  // Sort each bucket by confidence desc and cap at 4
+  for (const k of Object.keys(buckets)) {
+    buckets[k].sort((a, b) => (b.confidence_pct ?? 0) - (a.confidence_pct ?? 0));
+    buckets[k] = buckets[k].slice(0, 4);
+  }
+  return buckets;
+}
+
 export default async function handler(req, res) {
   try {
     res.setHeader("Cache-Control", "no-store");
+
     const ymd  = sanitizeYmd(req.query.ymd);
     const slot = sanitizeSlot(req.query.slot);
 
-    // 1) Try locked games (full items with confidence if available)
+    // 1) Prefer full locked items (carry confidence if your selector writes it)
     let games = [];
-    try {
-      const g = await s.kvGet("vb-locked:kv:hit:games");
-      if (Array.isArray(g)) games = g;
-    } catch {}
+    const locked = await kvGetSafe("vb-locked:kv:hit:games");
+    if (Array.isArray(locked)) games = locked;
 
-    // 2) If no full items, use ID list then fill details from vb:fixture:<id>
+    // 2) If no full items, fallback to IDs -> fixtures
     let ids = [];
     if (!games.length) {
-      try { ids = uniqueIds(await s.kvGet("vb-locked:kv:hit") || []); } catch { ids = []; }
+      const idList = await kvGetSafe("vb-locked:kv:hit");
+      ids = uniqueIds(idList);
       if (!ids.length) {
+        // fallback chain for the day/slot
         const chain = [`vbl_full:${ymd}:${slot}`, `vbl_full:${ymd}`, `vb:day:${ymd}:union`];
         for (const k of chain) {
-          try {
-            const v = await s.kvGet(k);
-            ids = uniqueIds(v);
-            if (ids.length) break;
-          } catch {}
+          const v = await kvGetSafe(k);
+          ids = uniqueIds(v);
+          if (ids.length) break;
         }
       }
       if (ids.length) {
@@ -196,13 +209,13 @@ export default async function handler(req, res) {
             awayTeam: v.away ?? v.awayTeam ?? null,
             leagueName: v.leagueName ?? v.league ?? null,
             start: v.kickoff ?? v.start ?? v.startTime ?? null,
-            startTime: v.kickoff ?? v.start ?? v.startTime ?? null,
+            startTime: v.kickoff ?? v.start ?? v.startTime ?? null
           };
         });
       }
     }
 
-    // 3) Filter by slot window + league blocks
+    // 3) Filter by window/league blocks (same as before)
     games = games.filter(g => {
       const league = g.leagueName ?? g.league ?? null;
       if (league && isBlockedLeagueName(league)) return false;
@@ -212,15 +225,40 @@ export default async function handler(req, res) {
       return true;
     });
 
-    // 4) Odds from KV (no AF calls) + sort by kickoff
-    const oddsMap = await readOddsBulk(games.map(g => g.id));
-    games.sort((a,b)=> String(a.kickoff||"").localeCompare(String(b.kickoff||"")));
+    // 4) Confidence: prefer item.confidence_pct; otherwise borrow from combined
+    let haveAnyConfidence = games.some(g => typeof g.confidence_pct === "number" || typeof g.confidence === "number");
+    let combined = [];
+    let confMap = new Map();
+    if (!haveAnyConfidence) {
+      combined = await readCombined(ymd);
+      confMap = confidenceMapFrom(combined);
+      if (confMap.size) haveAnyConfidence = true;
+    }
 
-    // 5) Take first 15
-    const picked = games.slice(0, 15).map(g => {
+    // Attach unified confidence to items (confidence_pct)
+    const withConf = games.map(g => {
+      let c = (typeof g.confidence_pct === "number" ? g.confidence_pct
+            : (typeof g.confidence === "number" ? g.confidence
+            : confMap.get(g.id)));
+      if (typeof c !== "number") c = 0;
+      return { ...g, confidence_pct: c };
+    });
+
+    // 5) Sort by confidence desc (tie-breaker: kickoff asc), then pick TOP 15
+    withConf.sort((a, b) => {
+      const dc = (b.confidence_pct ?? 0) - (a.confidence_pct ?? 0);
+      if (dc !== 0) return dc;
+      return String(a.kickoff || "").localeCompare(String(b.kickoff || ""));
+    });
+    const picked = withConf.slice(0, 15);
+
+    // 6) Odds (KV only) for the selected fixtures
+    const oddsMap = await readOddsBulk(picked.map(x => x.id));
+    const items = picked.map(g => {
       const odds = oddsMap.get(g.id) ?? null;
-      const obj = {
-        id: g.id, leagueId: (typeof g.leagueId === "number") ? g.leagueId : null,
+      return {
+        id: g.id,
+        leagueId: (typeof g.leagueId === "number") ? g.leagueId : null,
         home: g.home ?? g.homeTeam ?? undefined,
         away: g.away ?? g.awayTeam ?? undefined,
         league: g.league ?? g.leagueName ?? undefined,
@@ -229,45 +267,33 @@ export default async function handler(req, res) {
         awayTeam: g.away ?? g.awayTeam ?? undefined,
         leagueName: g.league ?? g.leagueName ?? undefined,
         start: g.kickoff ?? g.start ?? g.startTime ?? undefined,
-        startTime: g.kickoff ?? g.start ?? g.startTime ?? undefined
+        startTime: g.kickoff ?? g.start ?? g.startTime ?? undefined,
+        confidence_pct: g.confidence_pct,
+        ...(odds ? { odds } : {})
       };
-      if (odds) obj.odds = odds;
-      if (g.confidence_pct != null) obj.confidence_pct = g.confidence_pct;
-      else if (g.confidence != null) obj.confidence = g.confidence;
-      return obj;
     });
 
-    // 6) Tickets (4×4): try primary KV then fallback KV
-    let tickets = await s.kvGet(`tickets:${ymd}:${slot}`).catch(()=>null);
-    if (!tickets) {
-      const raw = await kvGetDual(`tickets:${ymd}:${slot}`);
-      if (raw) {
-        try { tickets = (typeof raw === "string") ? JSON.parse(raw) : raw; } catch { tickets = null; }
-      }
-    }
+    // 7) Tickets: use saved snapshot if exists; else derive a safe fallback from combined
+    let tickets = await kvGetSafe(`tickets:${ymd}:${slot}`);
     if (!tickets || typeof tickets !== "object") {
-      tickets = { btts:[], ou25:[], htft:[], fh_ou15:[] };
+      if (!combined.length) combined = await readCombined(ymd);
+      tickets = buildTicketsFromCombined(combined);
     }
 
-    // 7) Meta
-    const metaRaw = await s.kvGet("vb-locked:kv:hit:meta").catch(()=>null);
+    // 8) Meta
+    const metaRaw = await kvGetSafe("vb-locked:kv:hit:meta");
     const nowIso = new Date().toISOString();
     const meta = {
-      ymd, slot, source:"vb-locked:kv:hit",
+      ymd, slot, source: "vb-locked:kv:hit",
       ts: metaRaw?.ts || nowIso,
       last_odds_refresh: metaRaw?.last_odds_refresh || nowIso,
-      returned: picked.length, cap: 15,
-      fallback_used: false
+      returned: items.length, cap: 15,
+      sorted_by: "confidence_pct_desc",
+      confidence_source: haveAnyConfidence ? (locked ? "locked-or-combined" : "combined") : "none"
     };
 
-    return res.status(200).json({
-      items: picked,
-      ids: picked.map(x => x.id),
-      games: picked,
-      tickets,
-      meta
-    });
+    return res.status(200).json({ items, ids: items.map(x => x.id), games: items, tickets, meta });
   } catch (e) {
-    return res.status(200).json({ ok:false, error: String(e?.message || e) });
+    return res.status(200).json({ ok: false, error: String(e?.message || e) });
   }
 }
