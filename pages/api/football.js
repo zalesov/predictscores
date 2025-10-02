@@ -2,7 +2,7 @@
 // slim=1 -> vraća proširene kartice (home/away/league/kickoff) do 15 kom, cap-guarded
 // legacy (bez slim=1) -> vraća IDs iz vbl_full (kao ranije)
 
-import { kvGet, kvSet } from "../../lib/kv-read";
+import * as s from "../../lib/kv-read";  // ✅ kompatibilno sa ostatkom koda
 
 export const config = { api: { bodyParser: false } };
 
@@ -24,25 +24,26 @@ function detectSlot(tz = TZ) {
 function spentKey(ymd, slot) { return `afc:spent:${ymd}:${slot}`; }
 function capFor(slot) { return SLOT_CAPS[slot] ?? 2000; }
 
-// Treat placeholders like "<YMD>", "%3CYMD%3E" etc. as missing.
+// Treat placeholders like "<YMD>" or "%3CYMD%3E" kao missing
 function sanitizeYmd(v) {
-  const s = decodeURIComponent(String(v || "")).trim();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
-  return s;
+  const sVal = decodeURIComponent(String(v || "")).trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(sVal)) return null;
+  return sVal;
 }
 function sanitizeSlot(v) {
-  const s = decodeURIComponent(String(v || "")).trim().toLowerCase();
-  if (!/^(am|pm|late)$/.test(s)) return null;
-  return s;
+  const sVal = decodeURIComponent(String(v || "")).trim().toLowerCase();
+  if (!/^(am|pm|late)$/.test(sVal)) return null;
+  return sVal;
 }
 
 async function countedAF(url, opts, ymd, slot) {
   const u = typeof url === "string" ? url : String(url?.url || url);
   if (!API_HINTS.some(h => u.includes(h))) return fetch(url, opts);
-  let spent = Number((await kvGet(spentKey(ymd, slot))) || 0);
+  let spent = 0;
+  try { spent = Number((await s.kvGet(spentKey(ymd, slot))) || 0); } catch {}
   if (spent >= capFor(slot)) throw new Error(`CAP_REACHED:${slot}:${spent}/${capFor(slot)}`);
   const resp = await fetch(url, opts);
-  try { await kvSet(spentKey(ymd, slot), String(spent + 1)); } catch {}
+  try { await s.kvSet(spentKey(ymd, slot), String(spent + 1)); } catch {}
   return resp;
 }
 
@@ -81,10 +82,13 @@ export default async function handler(req, res) {
 
     if (slim) {
       // locked -> fallback vbl_full
-      let locked = await kvGet("vb-locked:kv:hit");
+      let locked = [];
+      try { locked = await s.kvGet("vb-locked:kv:hit"); } catch { locked = []; }
       if (!Array.isArray(locked) || locked.length === 0) {
-        const vbl = await kvGet(`vbl_full:${ymd}:${slot}`);
-        locked = Array.isArray(vbl) ? vbl.slice(0, 15) : [];
+        try {
+          const vbl = await s.kvGet(`vbl_full:${ymd}:${slot}`);
+          locked = Array.isArray(vbl) ? vbl.slice(0, 15) : [];
+        } catch { locked = []; }
       }
       const ids = Array.isArray(locked) ? locked.slice(0, 15) : [];
 
@@ -100,8 +104,9 @@ export default async function handler(req, res) {
       });
     }
 
-    // legacy: samo IDs iz vbl_full
-    const vbl = await kvGet(`vbl_full:${ymd}:${slot}`) || [];
+    // legacy: samo IDs iz vbl_full (kao ranije)
+    let vbl = [];
+    try { vbl = await s.kvGet(`vbl_full:${ymd}:${slot}`) || []; } catch { vbl = []; }
     const ids = Array.isArray(vbl) ? vbl : [];
     return res.status(200).json({
       ok: true, ymd, slot,
@@ -110,7 +115,7 @@ export default async function handler(req, res) {
       items: ids
     });
   } catch (e) {
-    // vrati dijagnostiku kao 200 da UI ne padne na 500
+    // Umesto 500, vrati 200 sa porukom – da UI ne “pukne”
     return res.status(200).json({ ok:false, error: String(e?.message || e) });
   }
 }
