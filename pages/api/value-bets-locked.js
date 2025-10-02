@@ -1,6 +1,7 @@
 // pages/api/value-bets-locked.js
-// Vraća zaključanu listu (vb-locked:kv:hit) i meta; fallback na vbl_full:<ymd>:<slot>
-// kad zaključana lista još nije postavljena. KV-only; bez AF poziva.
+// Vraća zaključanu listu za UI. Kad je slim=1, items su OBJEKTI { id } da UI ne renderuje praznu karticu.
+// Fallback: ako vb-locked nema stavke, koristi vbl_full:<ymd>:<slot> (prvih 15).
+// KV-only (bez API-Football poziva).
 
 function resolveKV() {
   const url = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
@@ -24,33 +25,39 @@ async function kvGet(key) {
     let v = arr?.[0]?.result ?? null;
     if (typeof v === 'string') { try { v = JSON.parse(v); } catch {} }
     return v;
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 }
+
 function ymdFromTZ(tz='Europe/Belgrade'){
-  const d = new Date(new Date().toLocaleString('en-US',{ timeZone: tz }));
-  const y=d.getFullYear(), m=String(d.getMonth()+1).padStart(2,'0'), dd=String(d.getDate()).padStart(2,'0');
+  const d = new Date(new Date().toLocaleString('en-US', { timeZone: tz }));
+  const y = d.getFullYear(), m = String(d.getMonth()+1).padStart(2,'0'), dd = String(d.getDate()).padStart(2,'0');
   return `${y}-${m}-${dd}`;
 }
 function slotByHour(h){ if(h<12)return'am'; if(h<17)return'pm'; return'late'; }
-function detectSlot(tz='Europe/Belgrade'){ const h=Number(new Date(new Date().toLocaleString('en-US',{timeZone:tz})).getHours()); return slotByHour(h); }
+function detectSlot(tz='Europe/Belgrade'){
+  const h = Number(new Date(new Date().toLocaleString('en-US',{ timeZone: tz })).getHours());
+  return slotByHour(h);
+}
 
-export default async function handler(req,res){
-  try{
-    const tz='Europe/Belgrade';
-    const ymd=(req.query.ymd||'').match(/^\d{4}-\d{2}-\d{2}$/)?req.query.ymd:ymdFromTZ(tz);
-    const slot=(req.query.slot||'').match(/^(am|pm|late)$/)?req.query.slot:detectSlot(tz);
+export default async function handler(req, res) {
+  try {
+    const tz = 'Europe/Belgrade';
+    const ymd = (req.query.ymd||'').match(/^\d{4}-\d{2}-\d{2}$/) ? req.query.ymd : ymdFromTZ(tz);
+    const slot = (req.query.slot||'').match(/^(am|pm|late)$/) ? req.query.slot : detectSlot(tz);
     const slim = String(req.query.slim||'0') === '1';
 
-    // 1) Pokušaj zaključanu listu
-    let items = (await kvGet('vb-locked:kv:hit')) || [];
+    // 1) Učitaj zaključanu listu
+    let locked = (await kvGet('vb-locked:kv:hit')) || [];
 
-    // 2) Fallback na vbl_full:<ymd>:<slot> (i iseći na cap=15)
-    if (!Array.isArray(items) || items.length === 0) {
+    // 2) Fallback na vbl_full:<ymd>:<slot> ako zaključana lista nije tu
+    if (!Array.isArray(locked) || locked.length === 0) {
       const vbl = (await kvGet(`vbl_full:${ymd}:${slot}`)) || [];
-      items = Array.isArray(vbl) ? vbl.slice(0, 15) : [];
+      locked = Array.isArray(vbl) ? vbl.slice(0, 15) : [];
     }
 
-    // 3) Meta – koristi realnu meta vrednost ako postoji, inače synth now
+    // 3) Meta – realna ako postoji, inače synth "now"
     const metaRaw = (await kvGet('vb-locked:kv:hit:meta')) || null;
     const nowIso = new Date().toISOString();
     const meta = {
@@ -59,16 +66,21 @@ export default async function handler(req,res){
       source: 'vb-locked:kv:hit',
       ts: metaRaw?.ts || nowIso,
       last_odds_refresh: metaRaw?.last_odds_refresh || nowIso,
-      returned: Array.isArray(items) ? Math.min(items.length, 15) : 0,
+      returned: Array.isArray(locked) ? Math.min(locked.length, 15) : 0,
       cap: 15,
     };
 
-    const payload = slim
-      ? { items: Array.isArray(items) ? items.slice(0, 15) : [], meta }
-      : { items, meta };
+    // 4) Slim=1 → vrati OBJEKTE { id } (UI kompatibilnost); bez slim → sirovi ID-evi
+    let items;
+    if (slim) {
+      const ids = Array.isArray(locked) ? locked.slice(0, 15) : [];
+      items = ids.map(id => ({ id }));
+    } else {
+      items = Array.isArray(locked) ? locked : [];
+    }
 
-    return res.status(200).json(payload);
-  }catch(e){
+    return res.status(200).json({ items, meta });
+  } catch (e) {
     return res.status(200).json({ ok:false, error:String(e?.message||e) });
   }
 }
