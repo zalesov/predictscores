@@ -2,50 +2,56 @@ name: odds-watcher
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    # Europe/Belgrade 00:00  -> UTC 22:00 (prethodni dan)
+    - cron: "0 22 * * *"
+    # Europe/Belgrade 10:00  -> UTC 08:00
+    - cron: "0 8 * * *"
+    # Europe/Belgrade 15:00  -> UTC 13:00
+    - cron: "0 13 * * *"
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    env:
-      BASE: https://predictscores.vercel.app
+    timeout-minutes: 10
     steps:
+      - name: Set up job
+        run: echo "Starting odds-watcher"
+
       - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
 
       - name: Compute YMD & SLOT (Europe/Belgrade)
         id: when
+        env:
+          TZ: Europe/Belgrade
         run: |
           YMD=$(TZ=Europe/Belgrade date +%F)
-          H=$(TZ=Europe/Belgrade date +%H)
-          if   [ "$H" -lt 12 ]; then SLOT=am;
-          elif [ "$H" -lt 17 ]; then SLOT=pm;
-          else                         SLOT=late; fi
+          HOUR=$(TZ=Europe/Belgrade date +%H)
+          if [ "$HOUR" -lt 12 ]; then SLOT="am"; elif [ "$HOUR" -lt 17 ]; then SLOT="pm"; else SLOT="late"; fi
           echo "ymd=$YMD"   >> $GITHUB_OUTPUT
           echo "slot=$SLOT" >> $GITHUB_OUTPUT
+          echo "Belgrade now: $YMD $HOUR:00 -> slot=$SLOT"
 
-      - name: Probe locked (items) and union length
-        id: probe
+      - name: Rebuild snapshot (+union)
+        env:
+          BASE: ${{ secrets.PS_BASE_URL }}
         run: |
-          Y="${{ steps.when.outputs.ymd }}"
-          S="${{ steps.when.outputs.slot }}"
-          LOCKED="$(curl -fsS "$BASE/api/value-bets-locked?ymd=$Y&slot=$S&slim=1" || echo '{}')"
-          ITEMS="$(echo "$LOCKED" | jq -r '.items | length // 0')"
-          UNION="$(curl -fsS "$BASE/api/debug/kv?key=vb:day:$Y:union" || echo '{}')"
-          ULEN="$(echo "$UNION" | jq -r '.kv.value | length // 0')"
-          echo "items=$ITEMS" >> $GITHUB_OUTPUT
-          echo "ulen=$ULEN"   >> $GITHUB_OUTPUT
+          curl -fsS "$BASE/api/cron/rebuild?ymd=${{ steps.when.outputs.ymd }}&slot=${{ steps.when.outputs.slot }}&debug=1"
 
-      - name: Skip when empty (save API calls)
-        if: steps.probe.outputs.items == '0' || steps.probe.outputs.ulen == '0'
+      - name: Apply learning (write vbl_full)
+        env:
+          BASE: ${{ secrets.PS_BASE_URL }}
         run: |
-          echo "Skipping: items=${{ steps.probe.outputs.items }}, union=${{ steps.probe.outputs.ulen }}"
-          exit 0
+          curl -fsS "$BASE/api/cron/apply-learning?ymd=${{ steps.when.outputs.ymd }}&slot=${{ steps.when.outputs.slot }}&debug=1"
 
-      - name: Refresh odds (guarded)
-        if: steps.probe.outputs.items != '0' && steps.probe.outputs.ulen != '0'
+      - name: Refresh odds (guarded + lock/meta)
+        env:
+          BASE: ${{ secrets.PS_BASE_URL }}
         run: |
-          Y="${{ steps.when.outputs.ymd }}"
-          S="${{ steps.when.outputs.slot }}"
-          curl -fsS "$BASE/api/cron/refresh-odds?ymd=$Y&slot=$S&debug=1"
+          curl -fsS "$BASE/api/cron/refresh-odds?ymd=${{ steps.when.outputs.ymd }}&slot=${{ steps.when.outputs.slot }}&debug=1"
+
+      - name: Complete job
+        run: echo "Done."
