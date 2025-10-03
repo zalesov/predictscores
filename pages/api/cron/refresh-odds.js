@@ -1,8 +1,6 @@
 // pages/api/cron/refresh-odds.js
-// FIX: no "Invalid URL". Uses existing KV envs (KV_REST_API_URL/TOKEN or UPSTASH_REDIS_REST_URL/TOKEN).
-// PURPOSE: Populate vb-odds:last:<fixtureId> by reusing your existing snapshot flow (TOA bulk) without
-// changing budgets. We cap TOA calls with KV counters (default 10/day).
-// NOTE: This file only hardens URL construction and KV usage; it does not increase call volume.
+// FIX: use today's vbl_full:<ymd>:<slot> as primary candidates (union with locked IDs).
+// Keeps TOA budget (default 10/day) and AF quotas unchanged. No new ENV.
 
 import * as s from "../../../lib/kv-read";
 
@@ -10,11 +8,8 @@ export const config = { api: { bodyParser: false } };
 
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
 const ODDS_BASE = "https://api.the-odds-api.com/v4"; // no new ENV needed
-const ODDS_KEY  = process.env.ODDS_API_KEY || "";    // you already have this
-
-// region/sports: use env if present, else safe defaults (keeps volume tiny)
+const ODDS_KEY  = process.env.ODDS_API_KEY || "";
 const ODDS_REGION = (process.env.ODDS_API_REGIONS || "eu").split(",")[0].trim() || "eu";
-// If you already define ODDS_API_SPORT_KEYS, we'll honor it; else we derive soccer_* list from /sports (1 call)
 const SPORTS_ENV = (process.env.ODDS_API_SPORT_KEYS || "").trim();
 
 function ymdToday() {
@@ -33,6 +28,7 @@ function sanitizeSlot(x) {
   return "pm";
 }
 function toArray(x) { return Array.isArray(x) ? x : []; }
+function uniqNums(arr) { return [...new Set(toArray(arr).map(x => typeof x === "number" ? x : x?.id).filter(n => typeof n === "number"))]; }
 function normTeam(s) {
   return String(s || "")
     .toLowerCase()
@@ -57,23 +53,17 @@ async function fetchJson(url) {
 }
 
 async function deriveSoccerSportKeys() {
-  // If you have ODDS_API_SPORT_KEYS defined, use it; else query /sports once and pick soccer_* keys
-  if (SPORTS_ENV) {
-    return SPORTS_ENV.split(",").map(s => s.trim()).filter(Boolean).slice(0, 10);
-  }
+  if (SPORTS_ENV) return SPORTS_ENV.split(",").map(s => s.trim()).filter(Boolean).slice(0, 10);
   try {
     const list = await fetchJson(`${ODDS_BASE}/sports?apiKey=${encodeURIComponent(ODDS_KEY)}&all=true`);
     const keys = toArray(list).map(x => x?.key).filter(k => typeof k === "string" && k.startsWith("soccer_"));
-    // Keep it small (<=10) to respect your budget
     return keys.slice(0, 10);
   } catch {
-    // Fallback to a tiny representative subset
     return ["soccer_epl","soccer_uefa_champs_league"];
   }
 }
 
 function bestH2HPrices(bookmakers) {
-  // Reduce all bookmakers/markets to best home/draw/away prices
   const out = { home:null, draw:null, away:null, source:"toa" };
   for (const bk of toArray(bookmakers)) {
     for (const mk of toArray(bk?.markets)) {
@@ -100,27 +90,20 @@ export default async function handler(req, res) {
     const slot = sanitizeSlot(req.query.slot);
     const debug = String(req.query.debug || "") === "1";
 
-    // --- candidate fixture ids for today/slot ---
-    let ids = [];
-    const lockedIds = await kvGetSafe("vb-locked:kv:hit");
-    if (Array.isArray(lockedIds)) ids = [...new Set(lockedIds.map(x => (typeof x === "number" ? x : x?.id)).filter(n => typeof n === "number"))];
-    if (!ids.length) {
-      const chain = [`vbl_full:${ymd}:${slot}`, `vbl_full:${ymd}`, `vb:day:${ymd}:union`];
-      for (const k of chain) {
-        const v = await kvGetSafe(k);
-        if (Array.isArray(v) && v.length) { ids = [...new Set(v.map(x => (typeof x === "number" ? x : x?.id)).filter(n => typeof n === "number"))]; break; }
-      }
-    }
+    // ---- PRIMARY CANDIDATES: today's vbl_full:<ymd>:<slot> ----
+    const vblSlot = uniqNums(await kvGetSafe(`vbl_full:${ymd}:${slot}`));
+    // ---- UNION with locked IDs (if present) ----
+    const lockedIds = uniqNums(await kvGetSafe("vb-locked:kv:hit"));
+    const ids = uniqNums([...(vblSlot || []), ...(lockedIds || [])]);
 
-    // Map fixtureId -> minimal meta for name/time matching
+    // Build fixture meta map for name/time matching
     const fixMap = new Map();
     if (ids.length) {
-      const cmds = ids.map(id => ["GET", `vb:fixture:${id}`]);
-      const resp = await (async () => {
-        try { return await s.kvPipeline(cmds); } catch { // degrade
-          return await Promise.all(cmds.map(async ([,k]) => ({ result: await kvGetSafe(k) })));
-        }
-      })();
+      const pipeline = ids.map(id => ["GET", `vb:fixture:${id}`]);
+      let resp = null;
+      try { resp = await s.kvPipeline(pipeline); } catch {
+        resp = await Promise.all(pipeline.map(async ([,k]) => ({ result: await kvGetSafe(k) })));
+      }
       ids.forEach((id,i) => {
         const v = resp?.[i]?.result ?? resp?.[i]?.value ?? null;
         if (v && typeof v === "object") fixMap.set(id, {
@@ -130,7 +113,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // --- TOA budget counters in KV (default 10/day) ---
+    // ---- TOA call budget (unchanged: default 10/day) ----
     const limitKey = `toa:limit:${ymd}`;
     const spentKey = `toa:spent:${ymd}`;
     const limit = Number(await kvGetSafe(limitKey)) || Number(process.env.ODDS_API_DAILY_BUDGET) || 10;
@@ -138,60 +121,60 @@ export default async function handler(req, res) {
     let remaining = Math.max(0, limit - spent);
 
     let sports = [];
-    if (ODDS_KEY) sports = await deriveSoccerSportKeys(); // small list (<=10)
+    if (ODDS_KEY) sports = await deriveSoccerSportKeys();
     const willCall = Math.min(remaining, sports.length);
 
-    const matchesWritten = [];
+    const matchedIds = new Set();
+
     if (ODDS_KEY && willCall > 0 && fixMap.size) {
-      // Fetch odds per sport (bulk), limited by remaining budget
       for (let i = 0; i < willCall; i++) {
         const sport = sports[i];
-        // 1 call = 1 sport snapshot
         const url = `${ODDS_BASE}/sports/${encodeURIComponent(sport)}/odds?regions=${encodeURIComponent(ODDS_REGION)}&markets=h2h&apiKey=${encodeURIComponent(ODDS_KEY)}`;
         let data = [];
         try { data = await fetchJson(url); }
         catch (e) { if (debug) console.error("TOA fetch error", sport, String(e)); continue; }
 
-        // For each event, try to match to our fixtures by name + same day
         for (const ev of toArray(data)) {
           const ht = normTeam(ev?.home_team), at = normTeam(ev?.away_team);
           const when = ev?.commence_time || ev?.commence_time_iso || ev?.start_time;
           if (!ht || !at || !when) continue;
 
           for (const [fid, meta] of fixMap.entries()) {
+            if (matchedIds.has(fid)) continue;
             const mh = normTeam(meta?.home), ma = normTeam(meta?.away);
             if (!mh || !ma) continue;
             if (!sameDayISO(when, meta?.kickoff)) continue;
-            // simple team match (order-agnostic just in case)
+
             const forward = (ht.includes(mh) && at.includes(ma)) || (mh.includes(ht) && ma.includes(at));
             const reverse = (ht.includes(ma) && at.includes(mh)) || (ma.includes(ht) && mh.includes(at));
             if (!forward && !reverse) continue;
 
             const best = bestH2HPrices(ev?.bookmakers);
-            // write vb-odds:last:<fid>
             await kvSetSafe(`vb-odds:last:${fid}`, best);
-            matchesWritten.push(fid);
+            matchedIds.add(fid);
           }
         }
-        // track calls
+
+        // spend one TOA call
         remaining = Math.max(0, remaining - 1);
         await kvSetSafe(spentKey, (Number(await kvGetSafe(spentKey)) || 0) + 1);
         if (remaining <= 0) break;
       }
     }
 
-    // Stamp meta for visibility
+    // Stamp meta
     const metaKey = "vb-locked:kv:hit:meta";
     const meta = await kvGetSafe(metaKey) || {};
     meta.last_odds_refresh = new Date().toISOString();
     await kvSetSafe(metaKey, meta);
 
+    const wrote = matchedIds.size;
+    const newSpent = Number(await kvGetSafe(spentKey)) || 0;
     const out = {
-      ok: true,
-      ymd, slot,
+      ok: true, ymd, slot,
       candidates: ids.length,
-      wrote: [...new Set(matchesWritten)].length,
-      toa: { limit, spent: (Number(await kvGetSafe(spentKey)) || 0), remaining: Math.max(0, limit - (Number(await kvGetSafe(spentKey)) || 0)) }
+      wrote,
+      toa: { limit, spent: newSpent, remaining: Math.max(0, limit - newSpent) }
     };
     if (debug) out.debug = { sports, region: ODDS_REGION };
     return res.status(200).json(out);
