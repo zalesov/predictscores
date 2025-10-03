@@ -1,7 +1,5 @@
 // pages/api/insights-build.js
-// PURPOSE: Build and store tickets:<ymd>:<slot> based on existing KV sources.
-// Safe-guards: coalesce any undefined arrays to [] so we never throw on ".length".
-// No external API calls; budgets unchanged.
+// Build tickets:<ymd>:<slot> with array guards (no crashes). KV-only.
 
 import * as s from "../../lib/kv-read";
 
@@ -24,49 +22,41 @@ function sanitizeSlot(x) {
   if (h < 15) return "am";
   return "pm";
 }
-
 function toArray(x) { return Array.isArray(x) ? x : []; }
-
-function byConfidenceDesc(a, b) {
-  const ca = (typeof a?.confidence_pct === "number" ? a.confidence_pct
-           : (typeof a?.confidence === "number" ? a.confidence
-           : (typeof a?.score === "number" ? a.score : 0)));
-  const cb = (typeof b?.confidence_pct === "number" ? b.confidence_pct
-           : (typeof b?.confidence === "number" ? b.confidence
-           : (typeof b?.score === "number" ? b.score : 0)));
-  return cb - ca;
+function conf(it) {
+  return (typeof it?.confidence_pct === "number" ? it.confidence_pct
+    : (typeof it?.confidence === "number" ? it.confidence
+    : (typeof it?.score === "number" ? it.score : 0)));
 }
-
-function mkTicketBuckets(fromCombined) {
+function byConfDesc(a,b){ return conf(b) - conf(a); }
+function makeTickets(combined) {
   const out = { btts: [], ou25: [], fh_ou15: [], htft: [] };
-  for (const it of toArray(fromCombined)) {
+  for (const it of toArray(combined)) {
     const mk = String(it?.market_key ?? it?.market ?? it?.type ?? "").toLowerCase();
-    const base = {
+    const row = {
       id: it?.fixture_id ?? it?.id,
-      confidence_pct:
-        (typeof it?.confidence_pct === "number" ? it.confidence_pct
-          : (typeof it?.confidence === "number" ? it.confidence
-          : (typeof it?.score === "number" ? it.score : 0))),
+      confidence_pct: conf(it),
       kickoff: it?.kickoff ?? it?.start ?? it?.startTime,
       leagueId: it?.leagueId ?? it?.league?.id,
       league: it?.leagueName ?? it?.league,
       home: it?.home ?? it?.homeTeam,
       away: it?.away ?? it?.awayTeam
     };
-    if (typeof base.id !== "number") continue;
-
-    if (mk.includes("btts")) out.btts.push(base);
-    else if (mk.includes("ou25") || mk.includes("over_2_5") || mk.includes("over25") || mk.includes("over 2.5")) out.ou25.push(base);
-    else if (mk.includes("fh_ou15") || mk.includes("over15_ht") || mk.includes("over 1.5 ht") || mk.includes("ht over 1.5")) out.fh_ou15.push(base);
-    else if (mk.includes("htft")) out.htft.push(base);
+    if (typeof row.id !== "number") continue;
+    if (mk.includes("btts")) out.btts.push(row);
+    else if (mk.includes("ou25") || mk.includes("over_2_5") || mk.includes("over25") || mk.includes("over 2.5")) out.ou25.push(row);
+    else if (mk.includes("fh_ou15") || mk.includes("over15_ht") || mk.includes("over 1.5 ht") || mk.includes("ht over 1.5")) out.fh_ou15.push(row);
+    else if (mk.includes("htft")) out.htft.push(row);
   }
-  // rank & cap to 4 each
   for (const k of Object.keys(out)) {
-    out[k].sort(byConfidenceDesc);
+    out[k].sort(byConfDesc);
     out[k] = out[k].slice(0, 4);
   }
   return out;
 }
+
+async function kvGetSafe(k){ try{ return await s.kvGet(k); }catch{ return null; } }
+async function kvSetSafe(k,v){ try{ await s.kvSet(k,v); }catch{} }
 
 export default async function handler(req, res) {
   try {
@@ -75,25 +65,20 @@ export default async function handler(req, res) {
     const slot = sanitizeSlot(req.query.slot);
     const debug = String(req.query.debug || "") === "1";
 
-    // Sources (KV only). Any of these can be missing; coalesce to [].
-    const lockedGames = toArray(await s.kvGet("vb-locked:kv:hit:games"));
-    const combined    = toArray(await s.kvGet(`vb:day:${ymd}:combined`));
-    const vblSlot     = toArray(await s.kvGet(`vbl_full:${ymd}:${slot}`));
+    const combined = toArray(await kvGetSafe(`vb:day:${ymd}:combined`));
+    const locked   = toArray(await kvGetSafe("vb-locked:kv:hit:games"));
+    const vbl      = toArray(await kvGetSafe(`vbl_full:${ymd}:${slot}`));
 
-    // Prefer combined to build tickets (carries market info).
-    const tickets = mkTicketBuckets(combined);
+    const tickets = makeTickets(combined);
+    await kvSetSafe(`tickets:${ymd}:${slot}`, tickets);
 
-    // Write snapshot
-    await s.kvSet(`tickets:${ymd}:${slot}`, tickets);
-
-    const out = { ok: true, wrote: `tickets:${ymd}:${slot}`, counts: {
-      lockedGames: lockedGames.length, combined: combined.length, vbl: vblSlot.length,
+    const out = { ok:true, wrote:`tickets:${ymd}:${slot}`, counts:{
+      lockedGames: locked.length, combined: combined.length, vbl: vbl.length,
       btts: tickets.btts.length, ou25: tickets.ou25.length, fh_ou15: tickets.fh_ou15.length, htft: tickets.htft.length
     }};
-
     if (debug) out.debug = { ymd, slot, ts: new Date().toISOString() };
     return res.status(200).json(out);
   } catch (e) {
-    return res.status(200).json({ ok: false, error: String(e?.message || e) });
+    return res.status(200).json({ ok:false, error: String(e?.message || e) });
   }
 }
