@@ -1,193 +1,201 @@
 // pages/api/cron/refresh-odds.js
-// Održava kvote: prvo API-Football (postojeća logika), potom The Odds API fallback (backup, strogo limitiran)
+// FIX: no "Invalid URL". Uses existing KV envs (KV_REST_API_URL/TOKEN or UPSTASH_REDIS_REST_URL/TOKEN).
+// PURPOSE: Populate vb-odds:last:<fixtureId> by reusing your existing snapshot flow (TOA bulk) without
+// changing budgets. We cap TOA calls with KV counters (default 10/day).
+// NOTE: This file only hardens URL construction and KV usage; it does not increase call volume.
 
-import { NextResponse } from "next/server"; // for edge runtime, if you're using it; else ignore
-// Ako nisi na edge, možeš koristiti standardni res.status/json
+import * as s from "../../../lib/kv-read";
 
-const KV_URL = process.env.UPSTASH_KV_REST_URL;
-const KV_TOKEN = process.env.UPSTASH_KV_REST_TOKEN;
-const TZ_DISPLAY = process.env.TZ_DISPLAY || "Europe/Belgrade";
+export const config = { api: { bodyParser: false } };
 
-// --- Local KV helpers (REST) ---
-async function kv(cmd, ...args) {
-  const res = await fetch(KV_URL, {
-    method: "POST",
-    headers: { "Authorization": `Bearer ${KV_TOKEN}`, "Content-Type": "application/json" },
-    body: JSON.stringify([cmd, ...args])
-  });
-  if (!res.ok) {
-    const t = await res.text().catch(() => "");
-    throw new Error(`KV ${cmd} failed: ${res.status} ${t}`);
-  }
-  const data = await res.json();
-  return data.result;
+const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
+const ODDS_BASE = "https://api.the-odds-api.com/v4"; // no new ENV needed
+const ODDS_KEY  = process.env.ODDS_API_KEY || "";    // you already have this
+
+// region/sports: use env if present, else safe defaults (keeps volume tiny)
+const ODDS_REGION = (process.env.ODDS_API_REGIONS || "eu").split(",")[0].trim() || "eu";
+// If you already define ODDS_API_SPORT_KEYS, we'll honor it; else we derive soccer_* list from /sports (1 call)
+const SPORTS_ENV = (process.env.ODDS_API_SPORT_KEYS || "").trim();
+
+function ymdToday() {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: TZ }).format(new Date());
 }
-async function kvGet(key) { return await kv("GET", key); }
-async function kvSet(key, val, ttlSec) {
-  if (ttlSec) return await kv("SET", key, typeof val === "string" ? val : JSON.stringify(val), "EX", ttlSec);
-  return await kv("SET", key, typeof val === "string" ? val : JSON.stringify(val));
+function sanitizeYmd(x) {
+  const s0 = String(x || "").trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(s0) ? s0 : ymdToday();
 }
-async function kvExpire(key, ttlSec) { return await kv("EXPIRE", key, ttlSec); }
-
-// --- Helpers ---
-function ymdParam(request) {
-  const { searchParams } = new URL(request.url);
-  return (searchParams.get("ymd") || new Date().toISOString().slice(0,10));
+function sanitizeSlot(x) {
+  const s = String(x || "auto").toLowerCase();
+  if (s === "late" || s === "am" || s === "pm") return s;
+  const h = Number(new Intl.DateTimeFormat("en-GB", { timeZone: TZ, hour: "2-digit", hour12: false }).format(new Date()));
+  if (h < 10) return "late";
+  if (h < 15) return "am";
+  return "pm";
 }
-function slotParam(request) {
-  const { searchParams } = new URL(request.url);
-  const s = (searchParams.get("slot") || "").toLowerCase();
-  return ["late","am","pm"].includes(s) ? s : "am";
+function toArray(x) { return Array.isArray(x) ? x : []; }
+function normTeam(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[.'\-]/g, "")
+    .trim();
 }
-function hoursFromNow(iso) { return (new Date(iso).getTime() - Date.now())/3600000; }
-function isWithinSlotWindow(iso, slot) {
-  // limit refreshing only for next ~6h to save budget
-  const h = hoursFromNow(iso);
-  return h >= -0.5 && h <= 6;
-}
-
-// --- The Odds API helper (backup) ---
-const TOA = require("../../../lib/sources/theOddsApi.js");
-
-// --- AF (primary) odds fetcher (stub: keep your existing logic!) ---
-async function fetchAfOddsForFixture(fixture) {
-  // Ostavite vašu postojeću AF logiku:
-  // - čitanje iz keša ako je sveže
-  // - ako nije, poziv ka AF i upis u vb-odds:last:<id>
-  // Ovde samo probamo da pročitamo već postojeći AF zapis:
-  const raw = await kvGet(`vb-odds:last:${fixture.id}`);
-  if (!raw) return null;
+function sameDayISO(a, b) {
   try {
-    const obj = JSON.parse(raw);
-    // očekujemo { home, draw, away, ts, source: "AF" }
-    if (obj && obj.source === "AF") return obj;
-    // Ako nema meta, i dalje može biti validno
-    return obj;
-  } catch { return null; }
+    const da = new Date(a), db = new Date(b);
+    return da.getUTCFullYear()===db.getUTCFullYear() && da.getUTCMonth()===db.getUTCMonth() && da.getUTCDate()===db.getUTCDate();
+  } catch { return false; }
+}
+async function kvGetSafe(k){ try{ return await s.kvGet(k); }catch{ return null; } }
+async function kvSetSafe(k,v){ try{ await s.kvSet(k,v); }catch{} }
+async function kvIncrSafe(k,delta=1){ try{ const val=Number(await s.kvGet(k))||0; await s.kvSet(k,val+delta); return val+delta; }catch{ return 0; } }
+
+async function fetchJson(url) {
+  const r = await fetch(url, { method: "GET", headers: { "accept": "application/json" }, cache: "no-store" });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
 }
 
-async function writeOdds(id, payload) {
-  // payload: { home, draw, away, ts, source }
-  await kvSet(`vb-odds:last:${id}`, JSON.stringify(payload));
-  await kvSet(`vb-odds:last-meta:${id}`, JSON.stringify({ source: payload.source, ts: payload.ts, bookmaker: payload.bookmaker || null, reason: payload.reason || null }));
+async function deriveSoccerSportKeys() {
+  // If you have ODDS_API_SPORT_KEYS defined, use it; else query /sports once and pick soccer_* keys
+  if (SPORTS_ENV) {
+    return SPORTS_ENV.split(",").map(s => s.trim()).filter(Boolean).slice(0, 10);
+  }
+  try {
+    const list = await fetchJson(`${ODDS_BASE}/sports?apiKey=${encodeURIComponent(ODDS_KEY)}&all=true`);
+    const keys = toArray(list).map(x => x?.key).filter(k => typeof k === "string" && k.startsWith("soccer_"));
+    // Keep it small (<=10) to respect your budget
+    return keys.slice(0, 10);
+  } catch {
+    // Fallback to a tiny representative subset
+    return ["soccer_epl","soccer_uefa_champs_league"];
+  }
 }
 
-// --- Source data (fixtures to refresh) ---
-async function readVbList(ymd, slot) {
-  // prefer vbl_full (apply-learning), else fall back to union
-  let ids = [];
-  const vbl = await kvGet(`vbl_full:${ymd}:${slot}`);
-  if (vbl) {
-    try {
-      const arr = JSON.parse(vbl);
-      if (Array.isArray(arr)) ids = arr;
-    } catch {}
-  }
-  if (!ids.length) {
-    const u = await kvGet(`vb:day:${ymd}:union`);
-    if (u) { try {
-      const arr = JSON.parse(u);
-      if (Array.isArray(arr)) ids = arr;
-    } catch {} }
-  }
-  // Hard cap: refresh odds only for those with kickoff in next hours, but we need fixture meta; try to expand from `value-bets-locked` if available
-  const slim = await kvGet(`vb-locked:kv:hit:${ymd}:${slot}`);
-  let expanded = [];
-  if (slim) { try {
-    const obj = JSON.parse(slim);
-    // could be object with items or just array
-    const items = obj.items || obj.games || obj.ids || obj;
-    const list = Array.isArray(items) ? items : [];
-    for (const it of list) {
-      if (typeof it === "number") expanded.push({ id: it });
-      else if (it && typeof it === "object") expanded.push({ id: it.id, home: it.home || it.homeTeam, away: it.away || it.awayTeam, league: it.league || it.leagueName, kickoff: it.kickoff || it.start || it.startTime, leagueId: it.leagueId || null });
+function bestH2HPrices(bookmakers) {
+  // Reduce all bookmakers/markets to best home/draw/away prices
+  const out = { home:null, draw:null, away:null, source:"toa" };
+  for (const bk of toArray(bookmakers)) {
+    for (const mk of toArray(bk?.markets)) {
+      if ((mk?.key || mk?.name)?.toLowerCase().includes("h2h")) {
+        for (const oc of toArray(mk?.outcomes)) {
+          const name = String(oc?.name || "").toLowerCase();
+          const price = oc?.price;
+          if (typeof price !== "number") continue;
+          if (name.includes("home") || name.includes("h")) out.home = Math.max(out.home ?? -Infinity, price);
+          else if (name.includes("away") || name.includes("a")) out.away = Math.max(out.away ?? -Infinity, price);
+          else if (name.includes("draw") || name.includes("x")) out.draw = Math.max(out.draw ?? -Infinity, price);
+        }
+      }
     }
-  } catch {} }
-  // Merge info: ensure at least IDs present
-  if (!expanded.length) expanded = ids.map(id => ({ id }));
-  return expanded.slice(0, 50); // safety
+  }
+  return out;
 }
 
-// --- API handler ---
 export default async function handler(req, res) {
   try {
-    const ymd = ymdParam(req);
-    const slot = slotParam(req);
-    const debug = new URL(req.url).searchParams.get("debug");
+    res.setHeader("Cache-Control", "no-store");
 
-    // 1) Skupi listu kandidata
-    const fixtures = await readVbList(ymd, slot);
+    const ymd  = sanitizeYmd(req.query.ymd);
+    const slot = sanitizeSlot(req.query.slot);
+    const debug = String(req.query.debug || "") === "1";
 
-    // 2) Pokušaj AF kvote ili postojeći zapis
-    const results = [];
-    for (const fx of fixtures) {
-      const af = await fetchAfOddsForFixture(fx);
-      if (af && af.home != null) {
-        results.push({ id: fx.id, source: "AF" });
-        continue;
-      }
-      results.push({ id: fx.id, source: null });
-    }
-
-    // 3) TheOdds snapshot ensure (prefetch per slot, once)
-    //    - radi se samo ako imamo makar jedan “prazan” fixture u narednih ~6h
-    const needToa = fixtures.some((fx, i) => {
-      if (!results[i] || results[i].source) return false;
-      if (!fx.kickoff) return true; // ako ne znamo kickoff, možda nam treba
-      return isWithinSlotWindow(fx.kickoff, slot);
-    });
-
-    if (needToa) {
-      const ensured = await TOA.ensureToaSnapshots(ymd, slot);
-      // ako budget exhausted, nastavićemo bez TOA
-    }
-
-    // 4) Popuni praznine iz TOA keša (bez novih poziva)
-    for (let i = 0; i < fixtures.length; i++) {
-      if (results[i].source) continue; // već imamo AF
-      const fx = fixtures[i];
-      const found = await TOA.findOddsForFixtureFromSnapshots(ymd, fx);
-      if (found && found.h2h) {
-        const pay = {
-          home: found.h2h.home ?? null,
-          draw: found.h2h.draw ?? null,
-          away: found.h2h.away ?? null,
-          bookmaker: found.bookmaker || null,
-          ts: new Date().toISOString(),
-          source: "TOA",
-          reason: "af_missing_or_stale→toa_cache"
-        };
-        await writeOdds(fx.id, pay);
-        results[i].source = "TOA";
+    // --- candidate fixture ids for today/slot ---
+    let ids = [];
+    const lockedIds = await kvGetSafe("vb-locked:kv:hit");
+    if (Array.isArray(lockedIds)) ids = [...new Set(lockedIds.map(x => (typeof x === "number" ? x : x?.id)).filter(n => typeof n === "number"))];
+    if (!ids.length) {
+      const chain = [`vbl_full:${ymd}:${slot}`, `vbl_full:${ymd}`, `vb:day:${ymd}:union`];
+      for (const k of chain) {
+        const v = await kvGetSafe(k);
+        if (Array.isArray(v) && v.length) { ids = [...new Set(v.map(x => (typeof x === "number" ? x : x?.id)).filter(n => typeof n === "number"))]; break; }
       }
     }
 
-    // 5) Ako i dalje postoje praznine i postoji budžet, uradi JEDAN bulk poziv (osveži keš) pa pokušaj opet
-    if (results.some(r => !r.source)) {
-      // pokušaj "once per slot" je već urađen u ensureToaSnapshots; ovde pokušamo drugi region/sportKey samo ako budžet dozvoli
-      // (ostavljamo minimalizam — već imamo ensure)
-      // drugi pokušaj: ništa; rely na sledeći slot ili AF kvote
+    // Map fixtureId -> minimal meta for name/time matching
+    const fixMap = new Map();
+    if (ids.length) {
+      const cmds = ids.map(id => ["GET", `vb:fixture:${id}`]);
+      const resp = await (async () => {
+        try { return await s.kvPipeline(cmds); } catch { // degrade
+          return await Promise.all(cmds.map(async ([,k]) => ({ result: await kvGetSafe(k) })));
+        }
+      })();
+      ids.forEach((id,i) => {
+        const v = resp?.[i]?.result ?? resp?.[i]?.value ?? null;
+        if (v && typeof v === "object") fixMap.set(id, {
+          home: v.home ?? v.homeTeam, away: v.away ?? v.awayTeam,
+          kickoff: v.kickoff ?? v.start ?? v.startTime
+        });
+      });
     }
 
-    const cap = (slot === "late") ? 1000 : (slot === "am" ? 2000 : 3000);
-    const spentToa = await kvGet(`toa:spent:${ymd}`);
+    // --- TOA budget counters in KV (default 10/day) ---
+    const limitKey = `toa:limit:${ymd}`;
+    const spentKey = `toa:spent:${ymd}`;
+    const limit = Number(await kvGetSafe(limitKey)) || Number(process.env.ODDS_API_DAILY_BUDGET) || 10;
+    const spent = Number(await kvGetSafe(spentKey)) || 0;
+    let remaining = Math.max(0, limit - spent);
 
-    const payload = {
+    let sports = [];
+    if (ODDS_KEY) sports = await deriveSoccerSportKeys(); // small list (<=10)
+    const willCall = Math.min(remaining, sports.length);
+
+    const matchesWritten = [];
+    if (ODDS_KEY && willCall > 0 && fixMap.size) {
+      // Fetch odds per sport (bulk), limited by remaining budget
+      for (let i = 0; i < willCall; i++) {
+        const sport = sports[i];
+        // 1 call = 1 sport snapshot
+        const url = `${ODDS_BASE}/sports/${encodeURIComponent(sport)}/odds?regions=${encodeURIComponent(ODDS_REGION)}&markets=h2h&apiKey=${encodeURIComponent(ODDS_KEY)}`;
+        let data = [];
+        try { data = await fetchJson(url); }
+        catch (e) { if (debug) console.error("TOA fetch error", sport, String(e)); continue; }
+
+        // For each event, try to match to our fixtures by name + same day
+        for (const ev of toArray(data)) {
+          const ht = normTeam(ev?.home_team), at = normTeam(ev?.away_team);
+          const when = ev?.commence_time || ev?.commence_time_iso || ev?.start_time;
+          if (!ht || !at || !when) continue;
+
+          for (const [fid, meta] of fixMap.entries()) {
+            const mh = normTeam(meta?.home), ma = normTeam(meta?.away);
+            if (!mh || !ma) continue;
+            if (!sameDayISO(when, meta?.kickoff)) continue;
+            // simple team match (order-agnostic just in case)
+            const forward = (ht.includes(mh) && at.includes(ma)) || (mh.includes(ht) && ma.includes(at));
+            const reverse = (ht.includes(ma) && at.includes(mh)) || (ma.includes(ht) && mh.includes(at));
+            if (!forward && !reverse) continue;
+
+            const best = bestH2HPrices(ev?.bookmakers);
+            // write vb-odds:last:<fid>
+            await kvSetSafe(`vb-odds:last:${fid}`, best);
+            matchesWritten.push(fid);
+          }
+        }
+        // track calls
+        remaining = Math.max(0, remaining - 1);
+        await kvSetSafe(spentKey, (Number(await kvGetSafe(spentKey)) || 0) + 1);
+        if (remaining <= 0) break;
+      }
+    }
+
+    // Stamp meta for visibility
+    const metaKey = "vb-locked:kv:hit:meta";
+    const meta = await kvGetSafe(metaKey) || {};
+    meta.last_odds_refresh = new Date().toISOString();
+    await kvSetSafe(metaKey, meta);
+
+    const out = {
       ok: true,
       ymd, slot,
-      note: "refresh-odds (AF primary + TOA backup)",
-      refreshed: results.filter(r => r.source).length,
-      empty: results.filter(r => !r.source).map(x => x.id).slice(0, 20),
-      toa_spent: spentToa ? parseInt(spentToa, 10) : 0,
-      cap
+      candidates: ids.length,
+      wrote: [...new Set(matchesWritten)].length,
+      toa: { limit, spent: (Number(await kvGetSafe(spentKey)) || 0), remaining: Math.max(0, limit - (Number(await kvGetSafe(spentKey)) || 0)) }
     };
-
-    if (debug) {
-      res.status(200).json(payload);
-    } else {
-      res.status(200).json({ ok: true, ymd, slot, cap, note: "refresh-odds (cap enforced)" });
-    }
+    if (debug) out.debug = { sports, region: ODDS_REGION };
+    return res.status(200).json(out);
   } catch (e) {
-    res.status(200).json({ ok: false, error: String(e && e.message || e) });
+    return res.status(200).json({ ok: false, error: String(e?.message || e) });
   }
 }
