@@ -1,18 +1,16 @@
 // pages/api/value-bets-locked.js
-// PURPOSE (no external API calls):
-// - Return the TOP 15 fixtures by highest confidence for the current slot (late/am/pm).
-// - Read odds from KV (vb-odds:last:<fixtureId>) and attach to cards.
-// - Return 4×4 tickets: if tickets:<ymd>:<slot> missing, compute from vb:day:<ymd>:combined as a fallback.
-// - Keep existing budgets and external-call behavior unchanged (this route does KV-only work).
+// TOP 15 by confidence (desc) for the current slot. KV-only. No external API calls.
+// - Attaches odds from vb-odds:last:<fixtureId>
+// - Attaches confidence from locked items, else borrows from vb:day:<ymd>:combined
+// - Returns 4x4 tickets from tickets:<ymd>:<slot> or builds from combined as fallback
 
 import * as s from "../../lib/kv-read";
 
 export const config = { api: { bodyParser: false } };
 
 const TZ = process.env.TZ_DISPLAY || "Europe/Belgrade";
-const BLOCKED_LEAGUE_IDS = []; // add league IDs here if you want to hard-block
+const BLOCKED_LEAGUE_IDS = [];
 
-/* ---------------- time & slot helpers ---------------- */
 function nowHourBG() {
   return Number(new Intl.DateTimeFormat("en-GB", { timeZone: TZ, hour: "2-digit", hour12: false }).format(new Date()));
 }
@@ -31,8 +29,6 @@ function sanitizeSlot(x) {
   if (h < 15) return "am";
   return "pm";
 }
-
-/* ---------------- list/window helpers ---------------- */
 function isBlockedLeagueName(name) {
   const n = String(name || "").toLowerCase();
   if (/\bu\d{2}\b/.test(n)) return true;
@@ -41,7 +37,6 @@ function isBlockedLeagueName(name) {
   return false;
 }
 function inSlotWindow(iso, slot) {
-  // Keep the existing hour windows, but final selection will be by confidence (desc)
   try {
     const hh = Number(new Intl.DateTimeFormat("en-GB", { timeZone: TZ, hour: "2-digit", hour12: false }).format(new Date(iso)));
     if (slot === "late") return hh < 10;
@@ -58,27 +53,20 @@ function uniqueIds(arr) {
   }
   return out;
 }
-
-/* ---------------- KV helpers ---------------- */
-async function kvGetSafe(key) {
-  try { return await s.kvGet(key); } catch { return null; }
-}
+async function kvGetSafe(key) { try { return await s.kvGet(key); } catch { return null; } }
 async function kvPipelineSafe(cmds) {
-  // try pipeline; if adapter throws, degrade to sequential GETs
   try {
     const r = await s.kvPipeline(cmds);
     if (Array.isArray(r)) return r;
   } catch {}
   const out = [];
-  for (const [_, k] of cmds) {
+  for (const [, k] of cmds) { // degrade to sequential gets
     // eslint-disable-next-line no-await-in-loop
     const v = await kvGetSafe(k);
     out.push({ result: v });
   }
   return out;
 }
-
-/* Read minimal per-fixture objects (home/away/league/kickoff) */
 async function readFixturesBulk(ids) {
   const out = new Map();
   if (!ids.length) return out;
@@ -91,8 +79,6 @@ async function readFixturesBulk(ids) {
   });
   return out;
 }
-
-/* Read odds objects written by refresh-odds (vb-odds:last:<id>) */
 async function readOddsBulk(ids) {
   const out = new Map();
   if (!ids.length) return out;
@@ -107,14 +93,10 @@ async function readOddsBulk(ids) {
   });
   return out;
 }
-
-/* Read combined list (used to borrow confidence if locked items don't carry it) */
 async function readCombined(ymd) {
   const v = await kvGetSafe(`vb:day:${ymd}:combined`);
   return Array.isArray(v) ? v : [];
 }
-
-/* Build confidence map from an array of items with fixture id + confidence fields */
 function confidenceMapFrom(arr) {
   const m = new Map();
   for (const it of Array.isArray(arr) ? arr : []) {
@@ -128,22 +110,17 @@ function confidenceMapFrom(arr) {
   }
   return m;
 }
-
-/* Generate 4×4 tickets from combined (fallback when tickets key is missing) */
 function buildTicketsFromCombined(combined) {
   const arr = Array.isArray(combined) ? combined : [];
   const buckets = { btts: [], ou25: [], fh_ou15: [], htft: [] };
-
   for (const it of arr) {
     const mk = String(it?.market_key ?? it?.market ?? it?.type ?? "").toLowerCase();
     const fid = it?.fixture_id ?? it?.id;
     if (typeof fid !== "number") continue;
-
     const confidence =
       (typeof it?.confidence_pct === "number" ? it.confidence_pct
         : (typeof it?.confidence === "number" ? it.confidence
         : (typeof it?.score === "number" ? it.score : 0)));
-
     const base = {
       id: fid,
       confidence_pct: confidence,
@@ -153,14 +130,11 @@ function buildTicketsFromCombined(combined) {
       home: it?.home ?? it?.homeTeam,
       away: it?.away ?? it?.awayTeam
     };
-
     if (mk.includes("btts")) buckets.btts.push(base);
     else if (mk.includes("ou25") || mk.includes("over_2_5") || mk.includes("over25") || mk.includes("over 2.5")) buckets.ou25.push(base);
     else if (mk.includes("fh_ou15") || mk.includes("over15_ht") || mk.includes("over 1.5 ht") || mk.includes("ht over 1.5")) buckets.fh_ou15.push(base);
     else if (mk.includes("htft")) buckets.htft.push(base);
   }
-
-  // Sort each bucket by confidence desc and cap at 4
   for (const k of Object.keys(buckets)) {
     buckets[k].sort((a, b) => (b.confidence_pct ?? 0) - (a.confidence_pct ?? 0));
     buckets[k] = buckets[k].slice(0, 4);
@@ -171,22 +145,18 @@ function buildTicketsFromCombined(combined) {
 export default async function handler(req, res) {
   try {
     res.setHeader("Cache-Control", "no-store");
-
     const ymd  = sanitizeYmd(req.query.ymd);
     const slot = sanitizeSlot(req.query.slot);
 
-    // 1) Prefer full locked items (carry confidence if your selector writes it)
     let games = [];
     const locked = await kvGetSafe("vb-locked:kv:hit:games");
     if (Array.isArray(locked)) games = locked;
 
-    // 2) If no full items, fallback to IDs -> fixtures
     let ids = [];
     if (!games.length) {
       const idList = await kvGetSafe("vb-locked:kv:hit");
       ids = uniqueIds(idList);
       if (!ids.length) {
-        // fallback chain for the day/slot
         const chain = [`vbl_full:${ymd}:${slot}`, `vbl_full:${ymd}`, `vb:day:${ymd}:union`];
         for (const k of chain) {
           const v = await kvGetSafe(k);
@@ -203,7 +173,7 @@ export default async function handler(req, res) {
             home: v.home ?? v.homeTeam ?? null,
             away: v.away ?? v.awayTeam ?? null,
             league: v.leagueName ?? v.league ?? null,
-            leagueId: v.leagueId ?? (v.league && v.league.id) ?? null,
+            leagueId: v.leagueId ?? v.league?.id ?? null,
             kickoff: v.kickoff ?? v.start ?? v.startTime ?? null,
             homeTeam: v.home ?? v.homeTeam ?? null,
             awayTeam: v.away ?? v.awayTeam ?? null,
@@ -215,7 +185,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // 3) Filter by window/league blocks (same as before)
+    // filter by time window/league block
     games = games.filter(g => {
       const league = g.leagueName ?? g.league ?? null;
       if (league && isBlockedLeagueName(league)) return false;
@@ -225,7 +195,7 @@ export default async function handler(req, res) {
       return true;
     });
 
-    // 4) Confidence: prefer item.confidence_pct; otherwise borrow from combined
+    // Confidence: prefer on item; else borrow from combined
     let haveAnyConfidence = games.some(g => typeof g.confidence_pct === "number" || typeof g.confidence === "number");
     let combined = [];
     let confMap = new Map();
@@ -234,8 +204,6 @@ export default async function handler(req, res) {
       confMap = confidenceMapFrom(combined);
       if (confMap.size) haveAnyConfidence = true;
     }
-
-    // Attach unified confidence to items (confidence_pct)
     const withConf = games.map(g => {
       let c = (typeof g.confidence_pct === "number" ? g.confidence_pct
             : (typeof g.confidence === "number" ? g.confidence
@@ -244,7 +212,7 @@ export default async function handler(req, res) {
       return { ...g, confidence_pct: c };
     });
 
-    // 5) Sort by confidence desc (tie-breaker: kickoff asc), then pick TOP 15
+    // sort by confidence desc (tie: kickoff asc), pick top 15
     withConf.sort((a, b) => {
       const dc = (b.confidence_pct ?? 0) - (a.confidence_pct ?? 0);
       if (dc !== 0) return dc;
@@ -252,7 +220,7 @@ export default async function handler(req, res) {
     });
     const picked = withConf.slice(0, 15);
 
-    // 6) Odds (KV only) for the selected fixtures
+    // odds for selected
     const oddsMap = await readOddsBulk(picked.map(x => x.id));
     const items = picked.map(g => {
       const odds = oddsMap.get(g.id) ?? null;
@@ -273,14 +241,13 @@ export default async function handler(req, res) {
       };
     });
 
-    // 7) Tickets: use saved snapshot if exists; else derive a safe fallback from combined
+    // tickets from snapshot or fallback from combined
     let tickets = await kvGetSafe(`tickets:${ymd}:${slot}`);
     if (!tickets || typeof tickets !== "object") {
       if (!combined.length) combined = await readCombined(ymd);
       tickets = buildTicketsFromCombined(combined);
     }
 
-    // 8) Meta
     const metaRaw = await kvGetSafe("vb-locked:kv:hit:meta");
     const nowIso = new Date().toISOString();
     const meta = {
@@ -289,7 +256,7 @@ export default async function handler(req, res) {
       last_odds_refresh: metaRaw?.last_odds_refresh || nowIso,
       returned: items.length, cap: 15,
       sorted_by: "confidence_pct_desc",
-      confidence_source: haveAnyConfidence ? (locked ? "locked-or-combined" : "combined") : "none"
+      confidence_source: haveAnyConfidence ? (Array.isArray(locked) ? "locked-or-combined" : "combined") : "none"
     };
 
     return res.status(200).json({ items, ids: items.map(x => x.id), games: items, tickets, meta });
