@@ -1,8 +1,6 @@
 // pages/api/value-bets-locked.js
-// TOP 15 by confidence (desc) for the current slot. KV-only. No external API calls.
-// - Attaches odds from vb-odds:last:<fixtureId>
-// - Attaches confidence from locked items, else borrows from vb:day:<ymd>:combined
-// - Returns 4x4 tickets from tickets:<ymd>:<slot> or builds from combined as fallback
+// TOP 15 by confidence for requested slot. KV-only (no external API calls).
+// NEW: If locked games are stale or filter to 0, fall back to today's vbl_full:<ymd>:<slot>.
 
 import * as s from "../../lib/kv-read";
 
@@ -13,6 +11,12 @@ const BLOCKED_LEAGUE_IDS = [];
 
 function nowHourBG() {
   return Number(new Intl.DateTimeFormat("en-GB", { timeZone: TZ, hour: "2-digit", hour12: false }).format(new Date()));
+}
+function ymdBG(date) {
+  try {
+    const d = date instanceof Date ? date : new Date(String(date));
+    return new Intl.DateTimeFormat("en-CA", { timeZone: TZ }).format(d);
+  } catch { return ""; }
 }
 function todayYmdBG() {
   return new Intl.DateTimeFormat("en-CA", { timeZone: TZ }).format(new Date());
@@ -60,7 +64,7 @@ async function kvPipelineSafe(cmds) {
     if (Array.isArray(r)) return r;
   } catch {}
   const out = [];
-  for (const [, k] of cmds) { // degrade to sequential gets
+  for (const [, k] of cmds) { // degrade to sequential
     // eslint-disable-next-line no-await-in-loop
     const v = await kvGetSafe(k);
     out.push({ result: v });
@@ -142,28 +146,35 @@ function buildTicketsFromCombined(combined) {
   return buckets;
 }
 
+function kickoffYmd(g) {
+  const iso = g?.kickoff ?? g?.start ?? g?.startTime;
+  return iso ? ymdBG(iso) : "";
+}
+
+async function loadVblFor(ymd, slot) {
+  const chain = [`vbl_full:${ymd}:${slot}`, `vbl_full:${ymd}`, `vb:day:${ymd}:union`];
+  for (const k of chain) {
+    const v = await kvGetSafe(k);
+    const ids = uniqueIds(v);
+    if (ids.length) return ids;
+  }
+  return [];
+}
+
 export default async function handler(req, res) {
   try {
     res.setHeader("Cache-Control", "no-store");
     const ymd  = sanitizeYmd(req.query.ymd);
     const slot = sanitizeSlot(req.query.slot);
 
+    // 1) Try locked full items (yesterday's might still be here)
     let games = [];
     const locked = await kvGetSafe("vb-locked:kv:hit:games");
     if (Array.isArray(locked)) games = locked;
 
-    let ids = [];
+    // 2) If nothing locked, seed from today's vbl/union
     if (!games.length) {
-      const idList = await kvGetSafe("vb-locked:kv:hit");
-      ids = uniqueIds(idList);
-      if (!ids.length) {
-        const chain = [`vbl_full:${ymd}:${slot}`, `vbl_full:${ymd}`, `vb:day:${ymd}:union`];
-        for (const k of chain) {
-          const v = await kvGetSafe(k);
-          ids = uniqueIds(v);
-          if (ids.length) break;
-        }
-      }
+      const ids = await loadVblFor(ymd, slot);
       if (ids.length) {
         const fixMap = await readFixturesBulk(ids);
         games = ids.map(id => {
@@ -185,8 +196,36 @@ export default async function handler(req, res) {
       }
     }
 
-    // filter by time window/league block
-    games = games.filter(g => {
+    // 3) If locked exists but is STALE (kickoff ymd != requested ymd), fall back to today's vbl
+    if (games.length) {
+      const allKickYmd = [...new Set(games.map(kickoffYmd).filter(Boolean))];
+      const allAreOtherDay = allKickYmd.length === 1 && allKickYmd[0] !== ymd;
+      if (allAreOtherDay) {
+        const todaysIds = await loadVblFor(ymd, slot);
+        if (todaysIds.length) {
+          const fixMap = await readFixturesBulk(todaysIds);
+          games = todaysIds.map(id => {
+            const v = fixMap.get(id) || {};
+            return {
+              id,
+              home: v.home ?? v.homeTeam ?? null,
+              away: v.away ?? v.awayTeam ?? null,
+              league: v.leagueName ?? v.league ?? null,
+              leagueId: v.leagueId ?? v.league?.id ?? null,
+              kickoff: v.kickoff ?? v.start ?? v.startTime ?? null,
+              homeTeam: v.home ?? v.homeTeam ?? null,
+              awayTeam: v.away ?? v.awayTeam ?? null,
+              leagueName: v.leagueName ?? v.league ?? null,
+              start: v.kickoff ?? v.start ?? v.startTime ?? null,
+              startTime: v.kickoff ?? v.start ?? v.startTime ?? null
+            };
+          });
+        }
+      }
+    }
+
+    // 4) Filter by slot/league
+    let filtered = games.filter(g => {
       const league = g.leagueName ?? g.league ?? null;
       if (league && isBlockedLeagueName(league)) return false;
       const lid = g.leagueId;
@@ -195,8 +234,32 @@ export default async function handler(req, res) {
       return true;
     });
 
-    // Confidence: prefer on item; else borrow from combined
-    let haveAnyConfidence = games.some(g => typeof g.confidence_pct === "number" || typeof g.confidence === "number");
+    // If filtering killed everything (e.g., locked had only PM), try today's VBL once more
+    if (!filtered.length) {
+      const todaysIds = await loadVblFor(ymd, slot);
+      if (todaysIds.length) {
+        const fixMap = await readFixturesBulk(todaysIds);
+        filtered = todaysIds.map(id => {
+          const v = fixMap.get(id) || {};
+          return {
+            id,
+            home: v.home ?? v.homeTeam ?? null,
+            away: v.away ?? v.awayTeam ?? null,
+            league: v.leagueName ?? v.league ?? null,
+            leagueId: v.leagueId ?? v.league?.id ?? null,
+            kickoff: v.kickoff ?? v.start ?? v.startTime ?? null,
+            homeTeam: v.home ?? v.homeTeam ?? null,
+            awayTeam: v.away ?? v.awayTeam ?? null,
+            leagueName: v.leagueName ?? v.league ?? null,
+            start: v.kickoff ?? v.start ?? v.startTime ?? null,
+            startTime: v.kickoff ?? v.start ?? v.startTime ?? null
+          };
+        }).filter(g => g.kickoff && inSlotWindow(g.kickoff, slot));
+      }
+    }
+
+    // 5) Confidence: prefer on item; else borrow from combined
+    let haveAnyConfidence = filtered.some(g => typeof g.confidence_pct === "number" || typeof g.confidence === "number");
     let combined = [];
     let confMap = new Map();
     if (!haveAnyConfidence) {
@@ -204,7 +267,7 @@ export default async function handler(req, res) {
       confMap = confidenceMapFrom(combined);
       if (confMap.size) haveAnyConfidence = true;
     }
-    const withConf = games.map(g => {
+    const withConf = filtered.map(g => {
       let c = (typeof g.confidence_pct === "number" ? g.confidence_pct
             : (typeof g.confidence === "number" ? g.confidence
             : confMap.get(g.id)));
@@ -212,7 +275,7 @@ export default async function handler(req, res) {
       return { ...g, confidence_pct: c };
     });
 
-    // sort by confidence desc (tie: kickoff asc), pick top 15
+    // 6) Sort by confidence desc (tie: kickoff asc), pick top 15
     withConf.sort((a, b) => {
       const dc = (b.confidence_pct ?? 0) - (a.confidence_pct ?? 0);
       if (dc !== 0) return dc;
@@ -220,7 +283,7 @@ export default async function handler(req, res) {
     });
     const picked = withConf.slice(0, 15);
 
-    // odds for selected
+    // 7) Odds (KV only) for the selected fixtures
     const oddsMap = await readOddsBulk(picked.map(x => x.id));
     const items = picked.map(g => {
       const odds = oddsMap.get(g.id) ?? null;
@@ -241,7 +304,7 @@ export default async function handler(req, res) {
       };
     });
 
-    // tickets from snapshot or fallback from combined
+    // 8) Tickets (snapshot or fallback from combined)
     let tickets = await kvGetSafe(`tickets:${ymd}:${slot}`);
     if (!tickets || typeof tickets !== "object") {
       if (!combined.length) combined = await readCombined(ymd);
