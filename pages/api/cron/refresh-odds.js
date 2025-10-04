@@ -161,27 +161,85 @@ export default async function handler(req, res) {
     const ids = uniqNums([...(vblSlot || []), ...(lockedIds || [])]);
 
     // Build fixture meta map for name/time matching
-    const fixMap = new Map();
-    if (ids.length) {
-      const pipeline = ids.map((id) => ["GET", `vb:fixture:${id}`]);
-      let resp = null;
-      try {
-        resp = await s.kvPipeline(pipeline);
-      } catch {
-        resp = await Promise.all(
-          pipeline.map(async ([, k]) => ({ result: await kvGetSafe(k) }))
-        );
-      }
+
+    //Naive improvemenst from ChatGpt from Alexey
+   // Build fixture meta map for name/time matching
+const fixMap = new Map();
+
+if (ids.length) {
+  const keyVariants = (id) => [
+    `vb:fixture:${id}`,
+    `vbl:fixture:${id}`,
+    `fixture:${id}`,
+  ];
+
+  // Try pipeline for the first variant; if it fails, fall back to per-key GET with all variants
+  try {
+    const pipeline = ids.map((id) => ["GET", keyVariants(id)[0]]); // vb:fixture:<id>
+    let resp = await s.kvPipeline(pipeline).catch(() => null);
+
+    // If pipeline returned unexpected shape, normalize; otherwise fall back to per-key logic
+    if (resp && Array.isArray(resp)) {
       ids.forEach((id, i) => {
-        const v = resp?.[i]?.result ?? resp?.[i]?.value ?? null;
-        if (v && typeof v === "object")
+        // Common shapes: [{ result }, { value }], or raw values
+        let raw = resp[i];
+        let v =
+          raw?.result ?? raw?.value ?? raw?.data ?? raw ?? null;
+
+        if (typeof v === "string") {
+          try { v = JSON.parse(v); } catch {}
+        }
+        if (v && typeof v === "object") {
           fixMap.set(id, {
             home: v.home ?? v.homeTeam,
             away: v.away ?? v.awayTeam,
             kickoff: v.kickoff ?? v.start ?? v.startTime,
           });
+        }
       });
     }
+
+    // If nothing loaded, try per-key with all variants
+    if (fixMap.size === 0) {
+      for (const id of ids) {
+        let v = null;
+        for (const k of keyVariants(id)) {
+          v = await kvGetSafe(k);
+          if (typeof v === "string") {
+            try { v = JSON.parse(v); } catch {}
+          }
+          if (v && typeof v === "object") break;
+        }
+        if (v && typeof v === "object") {
+          fixMap.set(id, {
+            home: v.home ?? v.homeTeam,
+            away: v.away ?? v.awayTeam,
+            kickoff: v.kickoff ?? v.start ?? v.startTime,
+          });
+        }
+      }
+    }
+  } catch (e) {
+    // Absolute fallback: brute-force per key + variants
+    for (const id of ids) {
+      let v = null;
+      for (const k of keyVariants(id)) {
+        v = await kvGetSafe(k);
+        if (typeof v === "string") {
+          try { v = JSON.parse(v); } catch {}
+        }
+        if (v && typeof v === "object") break;
+      }
+      if (v && typeof v === "object") {
+        fixMap.set(id, {
+          home: v.home ?? v.homeTeam,
+          away: v.away ?? v.awayTeam,
+          kickoff: v.kickoff ?? v.start ?? v.startTime,
+        });
+      }
+    }
+  }
+}
 
     // ---- TOA call budget (unchanged: default 10/day) ----
     const limitKey = `toa:limit:${ymd}`;
