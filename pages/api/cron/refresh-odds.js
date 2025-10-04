@@ -160,10 +160,43 @@ export default async function handler(req, res) {
     const lockedIds = uniqNums(await kvGetSafe("vb-locked:kv:hit"));
     const ids = uniqNums([...(vblSlot || []), ...(lockedIds || [])]);
 
+
+    
+// added the following code so that now we check fro time in milleseconds: [Alexey]
+function toMillis(x) {
+  if (x == null) return null;
+  if (x instanceof Date) return x.getTime();
+  if (typeof x === "number") {
+    // If it's seconds (e.g., 1696435200), convert to ms
+    return x < 1e12 ? x * 1000 : x;
+  }
+  // string
+  const t = Date.parse(x);
+  return Number.isFinite(t) ? t : null;
+}
+
+// Compare same calendar day in a given timezone (default Europe/Belgrade)
+function sameDayInTZ(a, b, tz = TZ) {
+  const ta = toMillis(a);
+  const tb = toMillis(b);
+  if (ta == null || tb == null) return false;
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  return fmt.format(ta) === fmt.format(tb);
+}
+// changes end here
+
+
+    
     // Build fixture meta map for name/time matching
 
     //Naive improvemenst from ChatGpt from Alexey
    // Build fixture meta map for name/time matching
+
 const fixMap = new Map();
 
 if (ids.length) {
@@ -214,7 +247,8 @@ if (ids.length) {
           fixMap.set(id, {
             home: v.home ?? v.homeTeam,
             away: v.away ?? v.awayTeam,
-            kickoff: v.kickoff ?? v.start ?? v.startTime,
+//Changed the next row to be in milliseconds [Alexey]   
+            kickoff: toMillis(v.kickoff ?? v.start ?? v.startTime),
           });
         }
       }
@@ -292,7 +326,9 @@ if (ids.length) {
             const mh = normTeam(meta?.home),
               ma = normTeam(meta?.away);
             if (!mh || !ma) continue;
-            if (!sameDayISO(when, meta?.kickoff)) continue;
+            
+            //changed the follofing from ISO to millisecond [Alexey]
+            if (!sameDayInTZ(when, meta?.kickoff)) continue;
 
             // allow fuzzy contains in either direction
             const forward =
